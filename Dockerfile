@@ -176,6 +176,23 @@ RUN pip install --no-cache-dir xgrammar==0.2.3 && \
     python3 -c "from xgrammar import StructuralTag, normalize_tool_choice" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
+# Bump openai for the tool-parser import chain (NamespaceTool). The NVIDIA base
+# ships openai 2.24.0. vLLM main's requirements only FLOOR it at `openai >= 2.0.0`
+# (requirements/common.txt) — an under-specified pin: vllm/tool_parsers/utils.py
+# does `from openai.types.responses import NamespaceTool`, and NamespaceTool only
+# landed in openai 2.25.0. So 2.24.0 satisfies the declared floor yet crashes the
+# server at STARTUP (import of tool_parsers, pulled in by cli_args → api_server),
+# crash-looping EVERY model — not just tool-use ones — with:
+#   ImportError: cannot import name 'NamespaceTool' from 'openai.types.responses'
+# Our --no-deps wheel install leaves the base's 2.24.0 in place, so pin here.
+# 2.45.0 = latest stable; openai is pure-python with loose deps (httpx/pydantic
+# already satisfied), so this touches neither NVIDIA's torch nor anything CUDA.
+# Validated 2026-07-17: openai 2.45.0 in vllm-custom:b12 imports tool_parsers +
+# cli_args + NamespaceTool cleanly. Guard fail-fasts if the symbol/torch regress.
+RUN pip install --no-cache-dir openai==2.45.0 && \
+    python3 -c "from openai.types.responses import NamespaceTool" && \
+    python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
+
 # Upgrade FlashInfer to the version vLLM main is built against.
 #
 # The NVIDIA base ships an internal FlashInfer 0.6.7 (0.6.7+...nvinternal.cu132).
