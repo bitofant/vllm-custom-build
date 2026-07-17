@@ -6,13 +6,11 @@ The image targets an RTX 5090 (Blackwell, compute 12.0) with cutting-edge CUDA d
 
 ## Why a custom build?
 
-> **NOTE (2026-07-02):** The driver has since been upgraded to **610.43.02 (CUDA 13.3 runtime)** — see Hardware table. The rationale below was written for the **old driver 580.x (CUDA 13.0 limit)** and its constraints no longer strictly apply: driver 610 runs CUDA 13.0/13.1/13.3 PTX, so the nvcc 13.0 override and the `26.03` base pin may now be **unnecessary**. The custom build strategy has **not** yet been re-evaluated against driver 610; treat the reasoning below as historical until it is. (The current build still works — nvcc 13.0 PTX is forward-compatible with driver 610.)
+We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidia/vllm` container so we can track bleeding-edge vLLM (features/fixes ahead of any NVIDIA release) while keeping NVIDIA's Blackwell-tuned CUDA/PyTorch runtime. The official `vllm/vllm-openai:latest` image lags and its CUDA/torch combo isn't matched to the RTX 5090 + our driver, so a custom build is needed to reconcile NVIDIA's base torch with the newer vLLM source and its CUDA-extension deps.
 
-The official `vllm/vllm-openai:latest` image uses CUDA 12.9, which is incompatible with NVIDIA driver 580.x. The standard PyTorch cu130 triggers CUDA forward-compat error 803 on the RTX 5090. A custom build is needed to reconcile:
-
-- **Driver 580.x** requires CUDA 13.1 runtime (only available in NVIDIA's internal PyTorch)
-- **vLLM's CUDA extensions** require full CUDA dev headers not present in the NVIDIA container
-- **nvcc 13.1** generates PTX that driver 580.x cannot run — so we substitute the CUDA 13.0 compiler
+> **HISTORY:** The original rationale (below, kept for context) was about **driver 580.x**, which capped at CUDA 13.0 and forced an `nvcc 13.0` override + the `26.03` base pin. The driver is now **610.43.02 (CUDA 13.3)**, so on **2026-07-17** the base was bumped to **`26.06-py3`** (torch 2.13, CUDA 13.3) and all the driver-580 workarounds were deleted — see "Base image (26.06)" below. The paragraphs that follow describe the retired 580.x constraints.
+>
+> _(Retired 580.x rationale)_ The official image used CUDA 12.9, incompatible with driver 580.x; standard PyTorch cu130 triggered forward-compat error 803. Driver 580.x needed the CUDA 13.1 runtime (only in NVIDIA's internal PyTorch), vLLM's CUDA extensions needed full dev headers absent from the NVIDIA container, and nvcc 13.1 generated PTX driver 580.x couldn't run — so we substituted the CUDA 13.0 compiler.
 
 ## Hardware
 
@@ -30,16 +28,22 @@ The official `vllm/vllm-openai:latest` image uses CUDA 12.9, which is incompatib
 | `update.sh` | Updates `vllm/` to latest upstream (fast-forward only) and kicks off an async build. Automates the mechanical part of `/latest`; does **not** watch or fix the build |
 | `build-async.sh` | **Preferred build script** — detaches from terminal, survives SSH disconnects |
 | `build.sh` | Synchronous build script (called internally by `build-async.sh`) |
-| `Dockerfile` | Multi-stage Dockerfile (see below) |
-| `vllm/` | vLLM source repo (cloned) |
+| `Dockerfile` | 2-stage Dockerfile, base `26.06-py3` (see below) |
+| `Dockerfile.26.03` | Archived previous 3-stage build (driver-580.x era); kept for reference/rollback |
+| `PLAN-base-26.06.md` | Base-bump plan + measured dependency audit |
+| `vllm/` | vLLM source, tracked as a **git submodule** → `github.com/vllm-project/vllm` (pins the built commit) |
 | `build.number` | Persisted monotonic build counter; `build.sh` increments it (on success only) and tags the image `vllm-custom:b<N>` |
 | `build.history` | Append-only log of successful builds: build number, date/time, and vLLM version. Distinct from `build.log` (full build output) |
 
-## Dockerfile strategy (3 stages)
+## Dockerfile strategy (2 stages, base `26.06-py3`)
 
-1. **`cuda-devel`** — pulls `nvidia/cuda:13.0.1-devel-ubuntu22.04` for its nvcc 13.0, headers, and libdevice
-2. **`builder`** — starts from `nvcr.io/nvidia/vllm:26.03.post1-py3` (NVIDIA's PyTorch with CUDA 13.1 runtime), then **overwrites** the CUDA 13.1 compiler toolchain with the 13.0 one from stage 0, builds vLLM from source into a wheel
-3. **Runtime** — fresh `nvcr.io/nvidia/vllm:26.03.post1-py3` base, installs the wheel built in stage 2
+1. **`builder`** — starts from `nvcr.io/nvidia/vllm:26.06-py3` (torch 2.13, CUDA 13.3) and builds vLLM from current source into a wheel using the base's **native nvcc 13.3**.
+2. **Runtime** — fresh `nvcr.io/nvidia/vllm:26.06-py3` base, installs the wheel (`--no-deps` to preserve NVIDIA's custom torch), then pins the handful of runtime deps that current source needs newer than the base's vLLM 0.22.1.
+
+> **26.03 → 26.06 bump (2026-07-17):** the old `cuda-devel` stage + nvcc-13.0 override, the `register_opaque_type` hoist sed, and the `cuda_view.cu` patch were all **deleted** — verified unnecessary on torch 2.13 / driver 610. The previous 3-stage 26.03 Dockerfile is archived as `Dockerfile.26.03`; see `PLAN-base-26.06.md` for the measured dep audit. Validated by building b14 and serving `vllm.sh 2` (Qwen NVFP4 MoE + MTP) end-to-end.
+
+### Pins the runtime stage still needs (source ahead of 26.06's vLLM 0.22.1)
+Because we build bleeding-edge source on a base tuned for 0.22.1, these stay pinned (guards fail-fast if a symbol/torch regresses): `transformers==5.12.1`, `xgrammar==0.2.3`, `flashinfer-python/-cubin==0.6.14` (+`--extra-index-url https://flashinfer.ai/whl/`), `compressed-tensors==0.17.0`, `humming-kernels==0.1.10`, `tokenspeed-mla==0.1.8`, `tilelang==0.1.9`, `nvidia-cutlass-dsl==4.6.0` + `quack-kernels==0.6.1` (matched cute-DSL pair), `apache-tvm-ffi==0.1.10`, `nvidia-cudnn-frontend>=1.19.1`, `mistral_common>=1.11.5`. The base bump **dropped** the previously-needed `openai` and `fastsafetensors` pins (26.06 satisfies them natively).
 
 ## Transformers pin (load-bearing) & Gemma 4 MTP
 
@@ -51,7 +55,7 @@ The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's
 - The drafter's `config.json` has `model_type: gemma4_assistant`. vLLM does **not** register this in its config registry (true even on upstream main) — it relies on **transformers** to recognize it, and that model_type only landed in **transformers 5.12.x**. `5.7.0` does NOT have it (despite the drafter stamping `5.7.0.dev0`); with anything <5.12 the engine crashes at config load: "Transformers does not recognize `gemma4_assistant`".
 - Validated 2026-07-02: 5.12.1 boots cleanly against our wheel, preserves NVIDIA's torch, and drives the drafter at ~80–91% draft acceptance (mean accept length ~1.8 → near ~1.8× decode). MTP is text-only (drafter has no vision tower); image prompts still run on the target.
 
-**A newer base image does NOT fix this.** As of 2026-07 the newest NVIDIA base is `26.06-py3` (torch 2.13, CUDA 13.3, vLLM 0.22.1) but it still ships **transformers 5.6.0** — below 5.12.1, so the explicit pin is still needed. Bumping the base is also risky: the CUDA 13.0 nvcc override, `cuda_view.cu` patch, and `register_opaque_type` hoist patch are all tuned to `26.03`'s torch 2.11 / CUDA 13.1 and would need re-validating against driver 580.105.08. Keep the current base + explicit transformers pin.
+**The 26.06 base does NOT fix this** — it ships **transformers 5.6.0** (below 5.12.1, no `gemma4_assistant`), so the explicit `transformers==5.12.1` pin is still required after the base bump. (The base bump itself was done on 2026-07-17 and did retire the nvcc override / `cuda_view.cu` / hoist patches — see "Dockerfile strategy" above — but the transformers pin is independent of the base and stays.)
 
 ## Building
 
@@ -107,24 +111,18 @@ Every build applies three tags:
 2. No tag edit needed — `~/scripts/vllm.sh` is pinned to `vllm-custom:latest`, which always tracks the newest build. (Pin to a specific `b<N>` tag only if you need to roll back.)
 3. Test: `source ~/scripts/vllm.sh; vllm rec 4` (removes and re-creates the vLLM docker container for Gemma4:31b)
 
-## Planned: base image bump to `26.06-py3` (deferred)
+## Base image bump to `26.06-py3` (DONE 2026-07-17, b14)
 
-Now that the driver is **610.43.02 (CUDA 13.3)**, the driver-580.x workarounds are obsolete and the base can move to `nvcr.io/nvidia/vllm:26.06-py3` (torch 2.13, CUDA 13.3, NVIDIA vLLM 0.22.1). This is a **maintainability/modernization** play — it is NOT required for Gemma 4 MTP (the transformers pin handles that on any base). **Do this as a separate, deliberate build effort — not bundled with unrelated changes.**
+The base was moved from `26.03.post1` to `nvcr.io/nvidia/vllm:26.06-py3` (torch 2.13, CUDA 13.3, NVIDIA vLLM 0.22.1) on driver 610. Outcome:
 
-**Prereq:** let the current `transformers==5.12.1` build finish and validate `vllm.sh 4m` first, so there's a known-good baseline to diff against.
+- Deleted the `cuda-devel` stage, nvcc-13.0 override, `register_opaque_type` hoist sed, and `cuda_view.cu` patch — all verified unnecessary on torch 2.13 (register_opaque_type has `hoist` natively; `cuda_view.cu` compiles unpatched against 2.13's stable ABI).
+- Dropped the `openai==2.45.0` and `fastsafetensors` pins (26.06 satisfies them).
+- Kept `transformers==5.12.1` and the CUDA/kernel pins listed under "Dockerfile strategy".
+- Fixed the cutlass/quack `ThrMma` crash via the matched `nvidia-cutlass-dsl==4.6.0` + `quack-kernels==0.6.1` pair.
 
-**Outline:**
-1. Bump **both** `FROM` lines (builder + runtime) to `26.06-py3`.
-2. **Delete the `cuda-devel` stage and the nvcc-13.0 override COPYs** — pure driver-580.x workarounds; on driver 610 use the base's native nvcc 13.3. (Overwriting a CUDA 13.3 base with 13.0 headers/nvcc is inconsistent.) This is the main simplification payoff.
-3. **Keep** `RUN pip install transformers==5.12.1` — `26.06` ships only 5.6.0 (< 5.12.1, no `gemma4_assistant`).
-4. Re-validate the torch/CUDA-keyed patches against torch 2.13; their grep guards fail-fast if stale:
-   - `cuda_view.cu` patch (highest risk) — keyed to torch 2.11.0a0's stable ABI; torch 2.13 likely matches upstream, so **probably revert to upstream's file** rather than patch.
-   - `register_opaque_type` hoist sed — may be unnecessary if 2.13 has the `hoist` param.
-   - FA4 `VLLM_FLASH_ATTN_SRC_DIR` unset — re-check the base's flash-attn snapshot path.
-5. Re-check runtime dep pins (`compressed-tensors==0.17.0`, `humming-kernels`, `tokenspeed-mla`, `tilelang`, `fastsafetensors`) against `26.06`'s 0.22.1 baseline — some may already be satisfied or now conflict.
-6. Budget for 1–2 failed builds (~60 min each). Keep the last good `vllm-custom:b<N>` as rollback; `vllm.sh` tracks `:latest`, so a bad build only bites once retagged.
+Validated: b14 serves `vllm.sh 2` (Qwen NVFP4 MoE + MTP) end-to-end. `Dockerfile.26.03` archives the previous build; `PLAN-base-26.06.md` has the full audit/rationale.
 
-Consider trialing in a separate `Dockerfile.26.06` first to avoid disturbing the working `Dockerfile`.
+> **Reminder for the next base bump:** we track bleeding-edge vLLM source, so *any* fixed NVIDIA base will lag some deps — expect to keep a set of CUDA/kernel pins in the runtime stage no matter what. Trial in a separate `Dockerfile.<ver>`, diff shipped versions against `vllm/requirements/{common,cuda}.txt` (see `PLAN-base-26.06.md` step 0 for the audit snippet), and validate `vllm.sh 2` (the cute-DSL warmup path) before promoting.
 
 ## issue.md — Bug Investigation Log
 
