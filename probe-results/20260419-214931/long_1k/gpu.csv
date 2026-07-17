@@ -1,0 +1,2 @@
+timestamp,mem_used_MiB,mem_total_MiB,gpu_util,mem_util,power_W,temp_C
+2026/04/19 21:49:32.980, 31110, 32607, 100, 88, 181.24, 39

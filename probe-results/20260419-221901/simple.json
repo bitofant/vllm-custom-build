@@ -1,0 +1,1 @@
+{"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","messages":[{"role":"user","content":"Say hi in one word."}],"max_tokens":8,"stream":false}

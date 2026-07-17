@@ -1,0 +1,22 @@
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":"1"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":","},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":" "},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":"2"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":","},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":" "},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":"3"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":"."},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-bec53b5529a13432","object":"chat.completion.chunk","created":1776649772,"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"stop","stop_reason":106,"token_ids":null}]}
+
+data: [DONE]
+

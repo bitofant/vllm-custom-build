@@ -1,0 +1,11 @@
+# Transient build artifacts (recreated by build-async.sh each run)
+build.log
+build.pid
+build.exit
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local, per-machine Claude settings (personal; not shared)
+.claude/settings.local.json

@@ -1,0 +1,6 @@
+curl: (28) Operation timed out after 60002 milliseconds with 0 bytes received
+http_code=000
+size_download=0
+time_total=60.002566
+time_starttransfer=0.000000
+time_connect=0.000089

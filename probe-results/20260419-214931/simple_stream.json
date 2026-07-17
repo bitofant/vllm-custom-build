@@ -1,0 +1,1 @@
+{"model":"cyankiwi/gemma-4-31B-it-AWQ-4bit","messages":[{"role":"user","content":"Count to three."}],"max_tokens":32,"stream":true}

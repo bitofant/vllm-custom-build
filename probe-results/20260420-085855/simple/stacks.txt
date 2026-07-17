@@ -1,0 +1,325 @@
+=== container ps ===
+    PID    PPID COMMAND         STAT %CPU %MEM
+      1       0 vllm            Ssl   2.7  2.3
+    421       1 python          S     0.0  0.0
+    422       1 VLLM::EngineCor Sl    5.7  4.1
+   3772       0 ps              Rs   33.3  0.0
+
+=== APIServer pid=1 /proc/1/stack ===
+(unavailable)
+
+=== EngineCore pid=422 /proc/422/stack ===
+(unavailable)
+
+=== EngineCore task stacks ===
+--- /proc/422/task/1090/stack ---
+(unavailable)
+--- /proc/422/task/1707/stack ---
+(unavailable)
+--- /proc/422/task/1708/stack ---
+(unavailable)
+--- /proc/422/task/1709/stack ---
+(unavailable)
+--- /proc/422/task/1710/stack ---
+(unavailable)
+--- /proc/422/task/1711/stack ---
+(unavailable)
+--- /proc/422/task/1712/stack ---
+(unavailable)
+--- /proc/422/task/1713/stack ---
+(unavailable)
+--- /proc/422/task/422/stack ---
+(unavailable)
+--- /proc/422/task/438/stack ---
+(unavailable)
+--- /proc/422/task/439/stack ---
+(unavailable)
+--- /proc/422/task/440/stack ---
+(unavailable)
+--- /proc/422/task/441/stack ---
+(unavailable)
+--- /proc/422/task/442/stack ---
+(unavailable)
+--- /proc/422/task/443/stack ---
+(unavailable)
+--- /proc/422/task/444/stack ---
+(unavailable)
+--- /proc/422/task/445/stack ---
+(unavailable)
+--- /proc/422/task/446/stack ---
+(unavailable)
+--- /proc/422/task/447/stack ---
+(unavailable)
+--- /proc/422/task/448/stack ---
+(unavailable)
+--- /proc/422/task/449/stack ---
+(unavailable)
+--- /proc/422/task/450/stack ---
+(unavailable)
+--- /proc/422/task/451/stack ---
+(unavailable)
+--- /proc/422/task/452/stack ---
+(unavailable)
+--- /proc/422/task/453/stack ---
+(unavailable)
+--- /proc/422/task/454/stack ---
+(unavailable)
+--- /proc/422/task/455/stack ---
+(unavailable)
+--- /proc/422/task/456/stack ---
+(unavailable)
+--- /proc/422/task/457/stack ---
+(unavailable)
+--- /proc/422/task/458/stack ---
+(unavailable)
+--- /proc/422/task/459/stack ---
+(unavailable)
+--- /proc/422/task/460/stack ---
+(unavailable)
+--- /proc/422/task/468/stack ---
+(unavailable)
+--- /proc/422/task/491/stack ---
+(unavailable)
+--- /proc/422/task/492/stack ---
+(unavailable)
+--- /proc/422/task/493/stack ---
+(unavailable)
+--- /proc/422/task/494/stack ---
+(unavailable)
+--- /proc/422/task/495/stack ---
+(unavailable)
+--- /proc/422/task/496/stack ---
+(unavailable)
+--- /proc/422/task/497/stack ---
+(unavailable)
+--- /proc/422/task/498/stack ---
+(unavailable)
+--- /proc/422/task/499/stack ---
+(unavailable)
+--- /proc/422/task/500/stack ---
+(unavailable)
+--- /proc/422/task/501/stack ---
+(unavailable)
+--- /proc/422/task/502/stack ---
+(unavailable)
+--- /proc/422/task/503/stack ---
+(unavailable)
+--- /proc/422/task/504/stack ---
+(unavailable)
+--- /proc/422/task/505/stack ---
+(unavailable)
+--- /proc/422/task/506/stack ---
+(unavailable)
+--- /proc/422/task/507/stack ---
+(unavailable)
+--- /proc/422/task/508/stack ---
+(unavailable)
+--- /proc/422/task/509/stack ---
+(unavailable)
+--- /proc/422/task/510/stack ---
+(unavailable)
+--- /proc/422/task/511/stack ---
+(unavailable)
+--- /proc/422/task/512/stack ---
+(unavailable)
+--- /proc/422/task/513/stack ---
+(unavailable)
+--- /proc/422/task/521/stack ---
+(unavailable)
+--- /proc/422/task/522/stack ---
+(unavailable)
+--- /proc/422/task/523/stack ---
+(unavailable)
+--- /proc/422/task/524/stack ---
+(unavailable)
+--- /proc/422/task/525/stack ---
+(unavailable)
+--- /proc/422/task/526/stack ---
+(unavailable)
+--- /proc/422/task/527/stack ---
+(unavailable)
+--- /proc/422/task/528/stack ---
+(unavailable)
+--- /proc/422/task/529/stack ---
+(unavailable)
+--- /proc/422/task/530/stack ---
+(unavailable)
+--- /proc/422/task/531/stack ---
+(unavailable)
+--- /proc/422/task/532/stack ---
+(unavailable)
+--- /proc/422/task/533/stack ---
+(unavailable)
+--- /proc/422/task/534/stack ---
+(unavailable)
+--- /proc/422/task/535/stack ---
+(unavailable)
+--- /proc/422/task/536/stack ---
+(unavailable)
+--- /proc/422/task/537/stack ---
+(unavailable)
+--- /proc/422/task/538/stack ---
+(unavailable)
+--- /proc/422/task/539/stack ---
+(unavailable)
+--- /proc/422/task/540/stack ---
+(unavailable)
+--- /proc/422/task/541/stack ---
+(unavailable)
+--- /proc/422/task/542/stack ---
+(unavailable)
+--- /proc/422/task/543/stack ---
+(unavailable)
+--- /proc/422/task/605/stack ---
+(unavailable)
+--- /proc/422/task/606/stack ---
+(unavailable)
+--- /proc/422/task/607/stack ---
+(unavailable)
+--- /proc/422/task/608/stack ---
+(unavailable)
+--- /proc/422/task/609/stack ---
+(unavailable)
+--- /proc/422/task/610/stack ---
+(unavailable)
+--- /proc/422/task/611/stack ---
+(unavailable)
+--- /proc/422/task/612/stack ---
+(unavailable)
+--- /proc/422/task/613/stack ---
+(unavailable)
+--- /proc/422/task/614/stack ---
+(unavailable)
+--- /proc/422/task/615/stack ---
+(unavailable)
+--- /proc/422/task/616/stack ---
+(unavailable)
+--- /proc/422/task/617/stack ---
+(unavailable)
+--- /proc/422/task/618/stack ---
+(unavailable)
+--- /proc/422/task/619/stack ---
+(unavailable)
+--- /proc/422/task/620/stack ---
+(unavailable)
+--- /proc/422/task/621/stack ---
+(unavailable)
+--- /proc/422/task/622/stack ---
+(unavailable)
+--- /proc/422/task/623/stack ---
+(unavailable)
+--- /proc/422/task/624/stack ---
+(unavailable)
+--- /proc/422/task/625/stack ---
+(unavailable)
+--- /proc/422/task/626/stack ---
+(unavailable)
+--- /proc/422/task/627/stack ---
+(unavailable)
+--- /proc/422/task/628/stack ---
+(unavailable)
+--- /proc/422/task/629/stack ---
+(unavailable)
+--- /proc/422/task/630/stack ---
+(unavailable)
+--- /proc/422/task/631/stack ---
+(unavailable)
+--- /proc/422/task/632/stack ---
+(unavailable)
+--- /proc/422/task/633/stack ---
+(unavailable)
+--- /proc/422/task/634/stack ---
+(unavailable)
+--- /proc/422/task/635/stack ---
+(unavailable)
+--- /proc/422/task/636/stack ---
+(unavailable)
+--- /proc/422/task/637/stack ---
+(unavailable)
+--- /proc/422/task/638/stack ---
+(unavailable)
+--- /proc/422/task/639/stack ---
+(unavailable)
+--- /proc/422/task/640/stack ---
+(unavailable)
+--- /proc/422/task/641/stack ---
+(unavailable)
+--- /proc/422/task/642/stack ---
+(unavailable)
+--- /proc/422/task/643/stack ---
+(unavailable)
+--- /proc/422/task/644/stack ---
+(unavailable)
+--- /proc/422/task/645/stack ---
+(unavailable)
+--- /proc/422/task/646/stack ---
+(unavailable)
+--- /proc/422/task/647/stack ---
+(unavailable)
+--- /proc/422/task/648/stack ---
+(unavailable)
+--- /proc/422/task/649/stack ---
+(unavailable)
+--- /proc/422/task/650/stack ---
+(unavailable)
+--- /proc/422/task/651/stack ---
+(unavailable)
+--- /proc/422/task/652/stack ---
+(unavailable)
+--- /proc/422/task/685/stack ---
+(unavailable)
+--- /proc/422/task/688/stack ---
+(unavailable)
+--- /proc/422/task/899/stack ---
+(unavailable)
+--- /proc/422/task/900/stack ---
+(unavailable)
+--- /proc/422/task/901/stack ---
+(unavailable)
+--- /proc/422/task/902/stack ---
+(unavailable)
+--- /proc/422/task/903/stack ---
+(unavailable)
+--- /proc/422/task/904/stack ---
+(unavailable)
+--- /proc/422/task/905/stack ---
+(unavailable)
+--- /proc/422/task/906/stack ---
+(unavailable)
+--- /proc/422/task/907/stack ---
+(unavailable)
+--- /proc/422/task/908/stack ---
+(unavailable)
+--- /proc/422/task/909/stack ---
+(unavailable)
+--- /proc/422/task/910/stack ---
+(unavailable)
+--- /proc/422/task/911/stack ---
+(unavailable)
+--- /proc/422/task/912/stack ---
+(unavailable)
+--- /proc/422/task/913/stack ---
+(unavailable)
+--- /proc/422/task/914/stack ---
+(unavailable)
+--- /proc/422/task/915/stack ---
+(unavailable)
+--- /proc/422/task/916/stack ---
+(unavailable)
+--- /proc/422/task/917/stack ---
+(unavailable)
+--- /proc/422/task/918/stack ---
+(unavailable)
+--- /proc/422/task/919/stack ---
+(unavailable)
+--- /proc/422/task/920/stack ---
+(unavailable)
+--- /proc/422/task/921/stack ---
+(unavailable)
+--- /proc/422/task/922/stack ---
+(unavailable)
+
+=== py-spy dump (if available) ===
+Error: Permission denied (os error 13)
+Reason: Permission denied (os error 13)
+(py-spy not installed — install with: docker exec vllm_gemma4-31b pip install py-spy)

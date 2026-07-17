@@ -1,0 +1,5 @@
+http_code=200
+size_download=598
+time_total=0.334131
+time_starttransfer=0.334061
+time_connect=0.000069
