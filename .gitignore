@@ -2,6 +2,7 @@
 build.log
 build.pid
 build.exit
+pr-description.md
 
 # Python cache
 __pycache__/
