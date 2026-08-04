@@ -29,6 +29,9 @@ cd "$SCRIPT_DIR"
 BRANCH="joran/bump-vllm-submodule-commit"
 BASE="main"
 
+# Seconds to wait after opening the PR before merging it (see "merge" below).
+MERGE_DELAY="${MERGE_DELAY:-3}"
+
 # Echo a command, then run it.
 run() {
     echo "+ $*"
@@ -89,12 +92,24 @@ echo ">>> PR: $PR_URL"
 
 ########################  merge  ###############################################
 
+# GitHub computes a PR's mergeability asynchronously after creation; merging
+# too fast can be rejected while that state is still "unknown". Give it a
+# moment to settle.
+run sleep "$MERGE_DELAY"
+
 run gh pr merge "$PR_URL" --merge --delete-branch
 
 ########################  back to main  ########################################
 
+# Fast-forward local $BASE *while it is not checked out*, then switch to it.
+# This keeps the working tree from ever passing through the pre-update state:
+# checking out a stale $BASE first (and pulling afterwards) would rewind
+# build.number/build.history/Dockerfile/... to their pre-bump contents for as
+# long as the pull took — and leave them there for good if the pull failed.
+# `fetch <remote> <ref>:<ref>` refuses a non-fast-forward on its own, so this
+# is as strict as the `pull --ff-only` it replaces.
+run git fetch origin "$BASE:$BASE"
 run git checkout "$BASE"
-run git pull --ff-only origin "$BASE"
 
 # --delete-branch above removes the remote branch, but the local one survives
 # whenever gh couldn't delete it — which is the normal case here, since it's
