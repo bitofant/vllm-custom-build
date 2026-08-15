@@ -4,6 +4,9 @@ build.pid
 build.exit
 pr-description.md
 
+# Local benchmark history (bench-inference.ts --report reads this)
+bench-results/
+
 # Python cache
 __pycache__/
 *.pyc
