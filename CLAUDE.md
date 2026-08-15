@@ -34,6 +34,8 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | `vllm/` | vLLM source, tracked as a **git submodule** → `github.com/vllm-project/vllm` (pins the built commit) |
 | `build.number` | Persisted monotonic build counter; `build.sh` increments it (on success only) and tags the image `vllm-custom:b<N>` |
 | `build.history` | Append-only log of successful builds: build number, date/time, and vLLM version. Distinct from `build.log` (full build output) |
+| `bench-inference.ts` | Inference benchmark against a **running** server (TTFT, decode tok/s, MTP acceptance). Node-native TS, no deps. Appends each run to `bench-results/bench.jsonl`; `--report` prints the saved history as a table |
+| `bench-results/` | Gitignored benchmark history (JSONL, one record per run). Read it with `bench-inference.ts --report` |
 
 ## Dockerfile strategy (2 stages, base `26.06-py3`)
 
