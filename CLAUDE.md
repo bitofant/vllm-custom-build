@@ -1,6 +1,6 @@
 # vLLM Custom Docker Build
 
-This directory is solely for building the base vLLM Docker image. It does **not** run models directly. Models are launched via `~/scripts/vllm.sh`, which uses this image as its base.
+This directory builds the base vLLM Docker image. It does **not** run models directly — model containers are launched via `vllm.sh` in this directory (aliased as `vllm` in `~/.bash_aliases`), which uses this image as its base.
 
 The image targets an RTX 5090 (Blackwell, compute 12.0) with cutting-edge CUDA drivers.
 
@@ -32,6 +32,7 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | `Dockerfile.26.03` | Archived previous 3-stage build (driver-580.x era); kept for reference/rollback |
 | `PLAN-base-26.06.md` | Base-bump plan + measured dependency audit |
 | `vllm/` | vLLM source, tracked as a **git submodule** → `github.com/vllm-project/vllm` (pins the built commit) |
+| `vllm.sh` | Interactive Docker model menu (aliased as `vllm`); launches model containers from `vllm-custom:latest` |
 | `build.number` | Persisted monotonic build counter; `build.sh` increments it (on success only) and tags the image `vllm-custom:b<N>` |
 | `build.history` | Append-only log of successful builds: build number, date/time, and vLLM version. Distinct from `build.log` (full build output) |
 | `bench-inference.ts` | Inference benchmark against a **running** server (TTFT, decode tok/s, MTP acceptance). Node-native TS, no deps. Appends each run to `bench-results/bench.jsonl`; `--report` prints the saved history as a table |
@@ -112,8 +113,8 @@ Every build applies three tags:
 ## After building
 
 1. Verify: `docker images | grep vllm-custom`
-2. No tag edit needed — `~/scripts/vllm.sh` is pinned to `vllm-custom:latest`, which always tracks the newest build. (Pin to a specific `b<N>` tag only if you need to roll back.)
-3. Test: `source ~/scripts/vllm.sh; vllm rec 4` (removes and re-creates the vLLM docker container for Gemma4:31b)
+2. No tag edit needed — `vllm.sh` is pinned to `vllm-custom:latest`, which always tracks the newest build. (Pin to a specific `b<N>` tag only if you need to roll back.)
+3. Test: `./vllm.sh rec 4` (removes and re-creates the vLLM docker container for Gemma4:31b)
 
 ## Base image bump to `26.06-py3` (DONE 2026-07-17, b14)
 
