@@ -80,22 +80,51 @@ RUN pip install --no-cache-dir xgrammar==0.2.3 && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
 # cute-DSL FA4 stack (the 26.03 blocker fix, cleaner here). 26.06 ships
-# cutlass-dsl 4.5.2 + quack 0.4.1; source 1214 pins nvidia-cutlass-dsl==4.6.0.
-# quack 0.6.1 declares cutlass-dsl==4.6.0 and its layout_utils no longer
-# references the removed cutlass.cute.core.ThrMma symbol — verified import-clean
-# on 26.06 (2026-07-17). The guard imports the exact modules vLLM's cute-DSL
-# kernel warmup pulls in (quack.compile_utils / quack.layout_utils), which is
-# what crash-looped EngineCore on the mismatched 26.03 pair.
-RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.0' quack-kernels==0.6.1 && \
+# cutlass-dsl 4.5.2 + quack 0.4.1; source now pins nvidia-cutlass-dsl==4.6.2 +
+# quack-kernels==0.6.4 (was 4.6.0/0.6.1). These two move together — quack 0.6.4
+# declares `nvidia-cutlass-dsl==4.6.2` exactly, as 0.6.1 declared 4.6.0 — so
+# bump them as a pair, from `vllm/requirements/cuda.txt`, never one alone.
+# quack's layout_utils no longer references the removed cutlass.cute.core.ThrMma
+# symbol (verified import-clean on 26.06, 2026-07-17). The guard imports the
+# exact modules vLLM's cute-DSL kernel warmup pulls in (quack.compile_utils /
+# quack.layout_utils), which is what crash-looped EngineCore on the mismatched
+# 26.03 pair.
+RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.2' quack-kernels==0.6.4 && \
     python3 -c "from quack.compile_utils import make_fake_tensor; import quack.layout_utils" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
-# flashinfer: 26.06 ships 0.6.12; source 1214 pins 0.6.14. cubin left PyPI at
-# 0.6.14 → needs flashinfer's own index (--extra-index-url). Guard checks the
-# kv_cache_sf kwarg (the fp8-KV NVFP4 regression) is present.
+# flashinfer: 26.06 ships 0.6.12. Keep this pin equal to `vllm/requirements/
+# cuda.txt` — it moves with source (0.6.14 → 0.6.18 upstream 7ab29234890,
+# 2026-08-30). cubin left PyPI at 0.6.14 → needs flashinfer's own index
+# (--extra-index-url).
+#
+# TWO guards, both for real skew we have shipped:
+#   kv_cache_sf     — the fp8-KV NVFP4 prefill regression.
+#   q_cu_seq_lens   — added to the XQA decode kernel by vLLM #52157/#49718.
+#     b19 shipped source that passes it against 0.6.14, which doesn't take it:
+#     every SM12x FlashInfer config crash-looped in cudagraph capture with
+#     "TypeError: ... unexpected keyword argument 'q_cu_seq_lens'". The
+#     kv_cache_sf guard passed (0.6.14 has it), so nothing caught the build.
+#     The XQA path is sm_120-gated, i.e. this box only — CI upstream won't
+#     cover it for us. Import from flashinfer.decode, the same module vLLM's
+#     _lazy_import_wrapper uses; it is not re-exported at package top level.
+#
+# The `nvidia-cutlass-dsl[cu13]==4.6.2` repeat is load-bearing, NOT redundant
+# with the block above. flashinfer 0.6.18 requires `nvidia-cutlass-dsl>=4.6.2a0`
+# — the `a0` suffix makes pip accept PRE-RELEASES for it, and the flashinfer
+# extra-index serves `4.8.0.dev0`. Without the repeat, this step silently
+# upgrades the cute-DSL pin installed above to that dev build, whose _mlir libs
+# are out of sync with their own Python shim: importing flashinfer then dies
+# with "module cutlass._mlir._mlir_libs._cutlass_ir._mlir.ir has no attribute
+# 'OpOperands'" (hit on the first 0.6.18 build, 2026-09-04). Pinning here makes
+# pip resolve both in one pass and fail loudly on a real conflict instead.
 RUN pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
-        flashinfer-python==0.6.14 flashinfer-cubin==0.6.14 && \
+        flashinfer-python==0.6.18 flashinfer-cubin==0.6.18 \
+        'nvidia-cutlass-dsl[cu13]==4.6.2' && \
+    python3 -c "import importlib.metadata as m; v = m.version('nvidia-cutlass-dsl'); assert v == '4.6.2', f'cute-DSL pin was clobbered by a flashinfer dep: {v}'" && \
+    python3 -c "from quack.compile_utils import make_fake_tensor; import quack.layout_utils" && \
     python3 -c "import inspect, flashinfer; from flashinfer import BatchPrefillWithPagedKVCacheWrapper as W; assert 'kv_cache_sf' in inspect.signature(W.run).parameters, 'FlashInfer run() is missing kv_cache_sf — version skew with vLLM main'" && \
+    python3 -c "import inspect; from flashinfer.decode import xqa_batch_decode_with_kv_cache as f; assert 'q_cu_seq_lens' in inspect.signature(f).parameters, 'FlashInfer xqa_batch_decode_with_kv_cache() is missing q_cu_seq_lens — version skew with vLLM main'" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
 # openai: NO pin needed — 26.06 ships 2.44.0, which has NamespaceTool (added in

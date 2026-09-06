@@ -3,7 +3,16 @@
  * Quick inference benchmark against a running vLLM OpenAI-compatible server.
  *
  * Streams a handful of varied prompts through /v1/chat/completions, measuring
- * per-request time-to-first-token (TTFT) and decode throughput (tok/s). When the
+ * per-request time-to-first-token (TTFT) and decode throughput (tok/s). One
+ * throwaway request runs first and is discarded: the first prompt of a run pays
+ * a warmup cost worth more than every difference this benchmark exists to
+ * detect. Records written before 2026-09-06 lack it (`warmup` field absent) and
+ * their first row reads high.
+ *
+ * Note the prompts are ~60-80 tokens, so TTFT here is per-request overhead, not
+ * prefill speed — there is not enough prompt to measure prefill. Measuring that
+ * would need a multi-thousand-token prompt, and then prefix caching WOULD skew
+ * it (see WARMUP_PROMPT) and would have to be defeated per run. When the
  * server has speculative decoding enabled (our Gemma 4 `4m` MTP config), it also
  * scrapes the Prometheus /metrics endpoint before/after to report draft
  * acceptance rate and mean accept length.
@@ -11,6 +20,11 @@
  * Every run appends one JSON record to `bench-results/bench.jsonl` (gitignored)
  * so numbers can be compared across builds; `--report` renders that history as a
  * table instead of running a benchmark.
+ *
+ * Timestamps are stored as UTC (`ts`, ISO-8601) but DISPLAYED in the local
+ * timezone, so `--report` lines up with local-time logs such as
+ * ~/scripts/vllm-startups.csv. Keep that split: don't localize what's written
+ * to disk, and don't print `ts` raw.
  *
  * No dependencies — uses Node's native fetch + TypeScript type-stripping
  * (Node >= 23.6, or 22.x with --experimental-strip-types). Run directly:
@@ -30,6 +44,20 @@ import { fileURLToPath } from "node:url";
 // Resolve next to the script, so results land here regardless of cwd.
 const RESULTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "bench-results");
 const RESULTS_FILE = join(RESULTS_DIR, "bench.jsonl");
+
+// Discarded first request. The first prompt of a run pays a warmup cost that has
+// nothing to do with the build under test: measured 2026-09-06, two runs six
+// seconds apart gave short-factual TTFT 0.741 then 0.046 (and code 0.461 then
+// 0.063) while the untouched later rows sat at 0.065 both times. Whichever
+// prompt goes first eats that tax, so spend it on a throwaway.
+//
+// Deliberately NOT one of the PROMPTS below: on configs with an ordinary block
+// size (gemma `4`: 16) a ~70-token prompt is several full blocks, so reusing a
+// measured prompt here would prime the prefix cache for its own measurement.
+// (On the hybrid configs block_size is 1616 and nothing under 1616 tokens is
+// ever cached, but don't rely on that holding for every model.)
+const WARMUP_PROMPT = "Reply with the single word: ready.";
+const WARMUP_TOKENS = 32;
 
 // (label, prompt) — a spread of decode-heavy tasks so tok/s is meaningful.
 const PROMPTS: [string, string][] = [
@@ -242,6 +270,12 @@ interface BenchRecord {
   model: string;
   serverVersion: string | null;
   maxTokens: number;
+  /**
+   * Whether a throwaway request preceded the measured prompts. Absent on
+   * records written before 2026-09-06; those have an inflated first row
+   * (usually short-factual) and their TTFTs are not comparable to warmed runs.
+   */
+  warmup: boolean;
   results: Result[];
   aggregate: Aggregate;
   spec: SpecSummary | null;
@@ -291,6 +325,32 @@ function fmt(x: number | null | undefined, digits: number): string {
   return x === null || x === undefined ? "n/a" : x.toFixed(digits);
 }
 
+/**
+ * Render a stored timestamp in the LOCAL timezone as "YYYY-MM-DD HH:MM".
+ *
+ * Records store `ts` as UTC (`new Date().toISOString()`) and that stays the
+ * on-disk format — it's unambiguous and comparable across machines/DST. Only
+ * the display is localized. Previously this column was a raw `ts.slice(0,16)`,
+ * which printed UTC and so read ~4h ahead of the wall clock on this box (EDT):
+ * a 22:56 run showed as `02:56` the FOLLOWING day, which made runs hard to line
+ * up against local-time logs like ~/scripts/vllm-startups.csv.
+ *
+ * getFullYear/getMonth/... (not the getUTC* variants) are what do the
+ * conversion; toISOString() here would silently undo the whole point.
+ */
+function formatLocalTs(ts: string | null | undefined): string {
+  if (!ts) return "-";
+  const d = new Date(ts);
+  // Malformed/legacy value: fall back to the old raw-prefix behaviour rather
+  // than printing "Invalid Date".
+  if (Number.isNaN(d.getTime())) return ts.slice(0, 16).replace("T", " ");
+  const p = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}`
+  );
+}
+
 function report(): void {
   const records = loadRecords();
   if (!records.length) {
@@ -298,7 +358,7 @@ function report(): void {
     return;
   }
   const rows = records.map((r) => ({
-    when: r.ts.slice(0, 16).replace("T", " "),
+    when: formatLocalTs(r.ts),
     tag: r.tag ?? r.serverVersion ?? "-",
     model: r.model.length > 34 ? r.model.slice(0, 33) + "…" : r.model,
     mean: fmt(r.aggregate?.decodeTpsMean, 1),
@@ -310,7 +370,7 @@ function report(): void {
   }));
 
   const cols: [string, keyof (typeof rows)[0], "l" | "r"][] = [
-    ["when", "when", "l"],
+    ["when (local)", "when", "l"],
     ["tag", "tag", "l"],
     ["model", "model", "l"],
     ["tok/s mean", "mean", "r"],
@@ -342,6 +402,20 @@ async function main() {
   const serverVersion = await detectServerVersion(args.host);
   const versionNote = serverVersion ? `  vLLM ${serverVersion}` : "";
   console.log(`Benchmarking  ${model}  @ ${args.host}  (max_tokens=${args.maxTokens})${versionNote}\n`);
+
+  // Warm up before the spec-metrics baseline, so the throwaway's draft tokens
+  // are not counted in the acceptance rate reported at the end.
+  process.stdout.write("warming up ... ");
+  let warmedUp = false;
+  try {
+    const w = await runPrompt(args.host, model, WARMUP_PROMPT, WARMUP_TOKENS);
+    warmedUp = true;
+    console.log(`${w.ttft === null ? "n/a" : w.ttft.toFixed(3)}s TTFT (discarded)\n`);
+  } catch (e) {
+    // A failed warmup is not a failed benchmark; the real prompts report their
+    // own errors. Say so and carry on, with the first row's tax un-paid.
+    console.log(`failed: ${(e as Error).message} — first row may read high\n`);
+  }
 
   const specBefore = await scrapeSpecMetrics(args.host);
 
@@ -421,6 +495,7 @@ async function main() {
       model,
       serverVersion,
       maxTokens: args.maxTokens,
+      warmup: warmedUp,
       results,
       aggregate: agg,
       spec,
