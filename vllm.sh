@@ -702,15 +702,16 @@ function vllm() {
       # outright via --kernel-config (see EXTRA): the cache file is populated and
       # hits ("Config cache hit for fp4_gemm"), so tuning buys ~nothing here.
       #
-      # --num-gpu-blocks-override 7000 PINS the KV pool, and DELIBERATELY takes
+      # --num-gpu-blocks-override 6780 PINS the KV pool, and DELIBERATELY takes
       # more than vLLM's profiler offers. Two separate reasons:
       #
       # 1. Profiling UNDER-estimates. vLLM compiles BEFORE the profiling pass
       #    that sizes KV, so the compile working set is resident while the peak
       #    is measured — memory it is about to release. A cold boot therefore
       #    reports only 6.87 GiB available (-> 5629 blocks / 87,388 tokens) and
-      #    leaves ~2.2 GiB of the budget unused at steady state. Overriding to
-      #    7000 claims it: 119,182 tokens, 1.14x concurrency at 105,000 ctx.
+      #    leaves ~2.2 GiB of the budget unused at steady state. Overriding
+      #    claims most of it back (see the 2026-09-09 retune below for the
+      #    current block count / token count / concurrency).
       #
       # 2. It closes the restart path, which is what actually crash-looped. The
       #    torch.compile cache lives in the container's writable layer and
@@ -724,8 +725,8 @@ function vllm() {
       # tokens/block is NOT linear — 5629 -> 15.5 tok/blk but 7000 -> 17.0.
       # Do not extrapolate; boot it and read vllm:cache_config_info.
       #
-      # HEADROOM: this leaves only ~117 MiB free, which is fine but is NOT a
-      # budget to spend further. It is stable rather than a countdown because
+      # HEADROOM: this leaves only a thin sliver free, which is fine but is NOT
+      # a budget to spend further. It is stable rather than a countdown because
       # chunked prefill caps activations at --max-num-batched-tokens (4096) per
       # step, so neither prompt length nor concurrency moves the high-water
       # mark. Verified 2026-08-03 at a steady 117 MiB across: 100,027-token
@@ -733,6 +734,34 @@ function vllm() {
       # (896x896). Re-derive from a COLD boot after any image bump — and note
       # CONTEXT_SIZE is part of the torch.compile cache key, so changing it
       # forces a full recompile. (2026-08-03)
+      #
+      # 2026-09-09: 7000 -> 6780. That "re-derive after any image bump" note was
+      # NOT honoured across b18/b19/b20/b21, and b21's larger non-KV footprint
+      # ate the 117 MiB. Symptom was NOT a tight crash loop (which is why it sat
+      # unnoticed): the engine served fine for 38 min / 4h13m, then a prefill
+      # chunk hit the fp8-KV MLP buffer
+      #   buf7 = empty_strided_cuda((s59=4096, 21504), torch.bfloat16) = 168 MiB
+      # against 154.88 MiB free, died with EngineDeadError, 500'd the in-flight
+      # request, and --restart unless-stopped silently brought it back. Both
+      # crashes reported the SAME 154.88 MiB free — a hard deterministic
+      # ceiling, not fragmentation drift, so it recurs on request shape alone.
+      # 7000 blocks claimed 8.37 GiB while the 0.982 budget only affords 8.11
+      # GiB (vLLM says so directly: "Replace gpu_memory_utilization config with
+      # --kv-cache-memory=8710538839"); 6780 gives that ~266 MiB back, covering
+      # the 168 MiB alloc with margin.
+      #
+      # MEASURED on the cold boot (b21, 2026-09-09), not extrapolated:
+      #   6780 blocks -> 115,437 tokens, 1.10x at 105,000 ctx (17.03 tok/blk)
+      #   device usage 31542 -> 31262 MiB idle, i.e. 280 MiB actually reclaimed
+      # Verified serving: a 90,022-token prompt (many 4096 chunks — the exact
+      # path that OOM'd) and 2 concurrent 38,521-token prompts, 0 OOM, 0 500s,
+      # 0 restarts. Device usage plateaued at 31964 MiB after the FIRST large
+      # prefill and did NOT move for the concurrent pair — re-confirming the
+      # high-water mark is pinned by --max-num-batched-tokens, not by prompt
+      # length or concurrency. NOTE the gpu_worker.py:871 line still prints
+      # "kv cache memory in use is 8.37 GiB" under the override; it reports the
+      # profiled figure, not the pinned pool. Trust nvidia-smi + the
+      # kv_cache_utils token count instead.
       MODEL_ID="RedHatAI/gemma-4-31B-it-NVFP4"
       QUANTIZATION="compressed-tensors"
       CONTEXT_SIZE=105000
@@ -742,7 +771,7 @@ function vllm() {
       CPU_OFFLOAD=0
       GPU_MEM_UTIL=0.982
       ENV_ARGS=(--env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 7000)
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6780)
       ;;
     4mc)
       # High-context turbo: LilaRest turbo (modelopt_fp4, TEXT-ONLY), NOT the
