@@ -12,7 +12,7 @@
 #   get_vllm_model_id() print the running server's model ID
 #
 # Menu (see the case statement for per-config details & quantization notes):
-#   1  Qwen3.8-27B-NVFP4          (150k ctx; '1c' = 228k ctx, '1k' = bf16 KV @ 76k)
+#   1  Qwen3.8-27B QAT-NVFP4      (110k ctx, bf16 KV; '1c'/'1k' = old unsloth PTQ)
 #   2  Qwen3.6-35B-A3B-NVFP4      (256k ctx, native MTP; custom image)
 #   3  DeepSeek-R1-Distill-32B-AWQ(32k ctx)
 #   4  Gemma-4-31B-IT-NVFP4       (nvidia, tiny ctx; '4m'/'4f' RedHatAI+MTP, '4mc' turbo text)
@@ -299,7 +299,7 @@ function rec_config_for_container() {
   # share RedHatAI/gemma-4-31B-it-NVFP4), so we key off the unique container name.
   # Keep this in sync with the DOCKER_NAME values in the case statement below.
   case "$1" in
-    vllm_qwen_3_8)               echo "1" ;;
+    vllm_qwen_3_8_qat)           echo "1" ;;
     vllm_qwen_3_8_228k)          echo "1c" ;;
     vllm_qwen_3_8_bf16kv)        echo "1k" ;;
     vllm_qwen3_6_35b_a3b_nvfp4)  echo "2" ;;
@@ -384,10 +384,10 @@ function vllm() {
     echo -e "${CYAN}║${RESET}${BOLD}                        vLLM Model Selection${RESET}                                ${CYAN}║${RESET}"
     echo -e "${CYAN}╚════════════════════════════════════════════════════════════════════════════╝${RESET}"
     echo ""
-    echo -e "${BOLD}1)${RESET} ${CYAN}Qwen3.8-27B-NVFP4${RESET}"
-    echo -e "   ${GRAY}150k context | fp8 KV cache | native MTP spec-decode${RESET}"
-    echo -e "   ${GRAY}Qwen 3.8 27B dense hybrid-attention, NVFP4 (Blackwell)${RESET}"
-    echo -e "   ${GRAY}(use '1c' for 228k max context, '1k' for bf16 KV cache @ 76k)${RESET}"
+    echo -e "${BOLD}1)${RESET} ${CYAN}Qwen3.8-27B-QUASAR-NVFP4 (QAT)${RESET}"
+    echo -e "   ${GRAY}110k context | bf16 KV cache | native MTP spec-decode${RESET}"
+    echo -e "   ${GRAY}Qwen 3.8 27B hybrid-attention, QAT NVFP4 + bf16 lm_head${RESET}"
+    echo -e "   ${GRAY}('1c'/'1k' = older unsloth PTQ quant: 228k ctx / bf16 KV @ 76k)${RESET}"
     echo ""
     echo -e "${BOLD}2)${RESET} ${CYAN}Qwen3.6-35B-A3B-NVFP4${RESET}"
     echo -e "   ${GRAY}256k context | MTP spec-decode | no offloading${RESET}"
@@ -441,74 +441,105 @@ function vllm() {
 
   case $model_choice in
     1)
-      # unsloth NVFP4 checkpoint -> compressed-tensors (quant_method in
-      # config.json, format "mixed-precision"), NOT the modelopt_fp4 the old
-      # nvidia 3.6 checkpoint used: nvidia has published no 3.8 NVFP4, so this
-      # tracks unsloth (same uploader as option 2). Weights ship as a single
-      # shard + model_mtp.safetensors.
-      # Architecture is UNCHANGED from 3.6 (Qwen3_5ForConditionalGeneration,
-      # model_type qwen3_5, 64 layers / head_dim 256 / 262k native / vocab
-      # 248320) — the registry already carries Qwen3_5ForConditionalGeneration
-      # and Qwen3_5MTP, so the parsers and MTP flags below carry over verbatim.
-      # Needs the Blackwell-capable local build (vllm-custom:latest) for SM120 NVFP4.
-      # MTP is native (draft layers built into the checkpoint), so --speculative-config
-      # needs no external drafter (unlike gemma 4m/4f). GPU_MEM_UTIL capped at 0.982:
-      # the newer flashinfer's fp4 autotune warmup needs a ~336 MiB transient that
-      # OOM-crash-looped at 0.983 on this image (same lesson as gemma 4m).
-      # CONTEXT_SIZE 150000 is INHERITED from the 3.6 tuning (identical dims, so
-      # the KV math should hold: 60k measured 2.59x -> ~155k KV total -> 150k @
-      # ~1.03x) but has NOT been re-measured on this checkpoint — re-derive from
-      # the "Maximum concurrency" log line on the first boot, as after any
-      # image/util change. --max-num-seqs 2 to match (MTP favors low
-      # concurrency); use option 1c for the full 228k.
+      # QAT NVFP4 checkpoint (QUASAR-QAT), bf16 KV. REPLACED the unsloth PTQ
+      # checkpoint + fp8 KV on 2026-09-07 after an audit of why this config felt
+      # markedly worse than gemma4 4m. Rollback: options 1c/1k still run unsloth.
       #
-      # --num-gpu-blocks-override 112 PINS the KV pool (b20, 2026-09-04). Without
-      # it this config no longer boots at all: b20's profiler sized 108 blocks
-      # (5.67 GiB) and the engine hard-errors rather than clamping — "estimated
-      # maximum model length is 143824", short of 150000.
+      # WHY THE SWAP — three measured asymmetries vs 4m, none of them "too few bits":
+      #  1. lm_head. unsloth quantizes lm_head to FP8; RedHatAI's gemma-4 (4m,
+      #     the config that feels good) keeps lm_head AND embeddings at BF16.
+      #     QUASAR also keeps lm_head/embeds/MTP/vision out of the quant (its
+      #     `ignore` list), so the output projection no longer perturbs every
+      #     logit. This is the one lever where 4m and old-1 differed outright.
+      #  2. KV exposure. This model is a HYBRID: layer_types is 48
+      #     linear_attention (DeltaNet, fixed-size recurrent state, NOT KV-cached
+      #     and NOT affected by --kv-cache-dtype) + only 16 full_attention layers
+      #     -- and those 16 are the model's ONLY exact long-range recall path.
+      #     With GQA at 4 KV heads x head_dim 256 that is 32,768 B/token of
+      #     long-range KV, vs 81,920 B/token for gemma-4 (10 full layers x 16 KV
+      #     heads), whose other 50 layers are sliding-window 1024 so their quant
+      #     error cannot accumulate along the sequence. Same --kv-cache-dtype fp8
+      #     flag, very different amount of redundancy absorbing the error. The old
+      #     unsloth checkpoint also baked a STATIC per-tensor fp8 KV scheme
+      #     (kv_cache_scheme: dynamic=false, strategy=tensor, static_minmax).
+      #     QUASAR ships kv_cache_scheme: null, so there is no baked scheme to
+      #     silently override the CLI (the `auto` trap documented in 1k does not
+      #     apply here) -- but keep passing the dtype explicitly anyway.
+      #  3. Size. QUASAR is 20.56 GB on disk vs unsloth's 23.42 GB (it is QAT, so
+      #     all 496 linears are NVFP4 W4A4 rather than unsloth's 168-of-496 with
+      #     attention+DeltaNet held at FP8). That ~2.7 GiB is what PAYS for the
+      #     bf16 KV below without collapsing context to 1k's 74k.
       #
-      # DERIVING THE NUMBER — pool blocks and ctx-eligible blocks are NOT the same
-      # unit, and conflating them sent the first attempt the wrong way (override
-      # 93 *lowered* the pool from 108 and made it worse, 119584 max len).
-      #   - block_size is 1616 tokens here, not the usual 16: it's forced up by
-      #     "attention page size >= mamba page size" on this hybrid model. So ctx
-      #     moves in 1616-token steps.
-      #   - ~19 blocks are held back from the max_model_len math (MTP draft layer
-      #     + the padding-layer waste the 1k notes measured at ~6.25%). Measured
-      #     twice, constant: 108 blocks -> 143824 = 89*1616; 93 -> 119584 = 74*1616.
-      #   => usable ctx = (N - 19) * 1616. 150000 needs 93 usable, so N = 112,
-      #      i.e. ~0.21 GiB beyond what profiling offered.
-      # Treat that as a conservative estimator, not an identity: it predicted a
-      # 150,288-token pool and the boot MEASURED 151,351 (1.01x @ 150k, engine
-      # init 180s, 761 MiB VRAM left free — autotune survived). Re-measure the
-      # 19 after an image bump; don't assume it holds.
+      # WHAT QAT BUYS is a reasoned bet, NOT a measured one. QUASAR's own card
+      # reports GPQA-D 0.9091 vs unsloth 0.8939 vs BF16 0.9141, but at n=396 x 2
+      # runs that gap is ~6 questions, z=1.02, 95% CI [-1.4%, +4.5%] -- NOT
+      # significant, and neither is BF16-vs-unsloth. Do not cite that table as
+      # proof. The defensible claims are (1) and (3) above, which are structural.
       #
-      # That is safe here for a specific reason: this vLLM now ESTIMATES cudagraph
-      # memory and subtracts it from KV up front ("--gpu-memory-utilization=0.9820
-      # is equivalent to 0.9624 without CUDA graph memory profiling") — a ~0.6 GiB
-      # reservation against a capture that measured 0.04 GiB on this config. The
-      # pin spends part of that over-estimate, not the fp4 autotune headroom that
-      # forced the 0.982 cap. Leave GPU_MEM_UTIL alone; it guards a different
-      # transient. If a future image makes 112 OOM during autotune, drop
-      # CONTEXT_SIZE to 143000 and the override with it, rather than raising util.
-      # Re-derive both after any image rebuild: read block_size + num_gpu_blocks
-      # from `curl -s localhost:8000/metrics | grep cache_config_info`.
+      # RISK: QUASAR quantizes attention and DeltaNet to W4A4, which the old
+      # checkpoint did not (it was W4A4 on MLPs only). That is new NVFP4
+      # activation-quant kernel surface on sm_120, i.e. exactly the class of
+      # thing that produced the b19 XQA `q_cu_seq_lens` breakage -- upstream CI
+      # does not cover this box. It can fail at FIRST MODEL START, not at build.
+      # If engine init dies in a flashinfer/cutlass kernel, first try
+      # --kernel-config '{"enable_flashinfer_autotune":false}' (the 4m lever);
+      # if it still fails, roll back to 1c/1k rather than chasing it.
       #
-      # b21 (2026-09-05) DID make 112 OOM -- but only on a COLD boot: the fp4
-      # autotune transient left the MTP drafter's cudagraph warmup 32 MiB short
-      # (b20 had 761 MiB free here; the 417->443 upstream bump ate it). Fixed by
-      # persisting ~/.cache/vllm (see the docker run block) rather than by
-      # spending context, since the warm path has always fit. If a future image
-      # OOMs even WARM, that's the real signal to take the 143000 downgrade.
-      MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
+      # CONTEXT_SIZE IS AN ESTIMATE -- RE-DERIVE ON FIRST BOOT. Old config 1
+      # measured a 151,351-token pool at fp8 (~49.4 KB/token) = ~6.96 GiB of KV.
+      # bf16 KV costs ~86.1 KB/token (measured in 1k: 1.75x, not 2x, because the
+      # DeltaNet/Mamba state is sized separately and ~6.25% is lost to padding
+      # layers). Freeing ~2.7 GiB of weights gives ~9.6 GiB of KV -> ~120k tokens
+      # bf16. 110000 is ~0.92x of that estimate: a THIN margin, set deliberately
+      # (2026-09-07) in preference to the safer 98304 first tried. The estimate
+      # itself is uncertain -- it assumes QUASAR's resident footprint scales like
+      # unsloth's on-disk delta, and the old checkpoint's resident size ran
+      # ~1.1 GiB ABOVE its on-disk size (scale swizzling into the FlashInfer
+      # NVFP4 layout). So treat a startup failure as expected-if-unlucky, not as
+      # a broken config. The tell is an engine-init abort reading "KV cache is
+      # needed, which is larger than the available KV cache memory" (or an
+      # "estimated maximum model length is <N>" line, which hands you the answer
+      # directly); drop to 98304 and it will boot. After it DOES boot, read the
+      # real number and re-tune toward ~1.0x concurrency:
+      #   docker logs vllm_qwen_3_8_qat 2>&1 | grep -i "GPU KV cache size"
+      #   curl -s localhost:8000/metrics | grep cache_config_info
+      # NOTE CONTEXT_SIZE is part of the torch.compile cache key, so each change
+      # costs a full recompile -- including the retry after a failed boot.
+      #
+      # --num-gpu-blocks-override IS DELIBERATELY ABSENT. The old value (112) was
+      # derived for unsloth's weights at fp8 KV and is actively wrong here: both
+      # the weight footprint and the per-token KV cost changed. Let the profiler
+      # size the pool; only pin it again after measuring, and re-derive the
+      # ~19-block holdback if you do.
+      #
+      # --chat-template: QUASAR ships Qwen's CANONICAL template, which is OLDER
+      # than the one unsloth patched. Two regressions matter: it has no
+      # multi/`developer` system-message merging, and it RAISES on
+      # reasoning_effort='high' (it accepts only xhigh/medium/low), which OpenAI
+      # clients send routinely -> a 400 on every such request. So we mount
+      # unsloth's patched template explicitly. Both default reasoning_effort to
+      # 'xhigh' and emit the same <tool_call><function=...> format, so
+      # --tool-call-parser qwen3_coder is unchanged and correct (qwen3_coder and
+      # qwen3_xml both resolve to the same Qwen3EngineToolParser class).
+      #
+      # Sampling is NOT overridden on purpose: generation_config.json ships
+      # temperature 1.0 / top_p 0.95 / top_k 20, which is exactly Qwen's
+      # documented THINKING-mode recipe, and neither pi nor OpenClaw overrides
+      # it. Do not "fix" this to 0.6/0.7 -- 0.7/top_p 0.8/presence_penalty 1.5 is
+      # the NON-thinking recipe and would be wrong here.
+      #
+      # DOCKER_NAME changed (was vllm_qwen_3_8) ON PURPOSE: a stopped container
+      # is RESTARTED, not recreated, so reusing the old name would silently
+      # relaunch the old checkpoint with the old flags.
+      MODEL_ID="QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4"
       QUANTIZATION="compressed-tensors"
-      CONTEXT_SIZE=150000
+      CONTEXT_SIZE=110000
       INPUT_MODES="text,image"
-      DOCKER_NAME="vllm_qwen_3_8"
+      DOCKER_NAME="vllm_qwen_3_8_qat"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
       GPU_MEM_UTIL=0.982
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --speculative-config '{"method":"mtp","num_speculative_tokens":4}' --num-gpu-blocks-override 112)
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype bfloat16 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --chat-template /etc/vllm/chat-templates/qwen3_8-patched.jinja --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
     1c)
       # Same as option 1 but with maximized context (228K of the 256K native).
