@@ -4,6 +4,12 @@ This directory builds the base vLLM Docker image. It does **not** run models dir
 
 The image targets an RTX 5090 (Blackwell, compute 12.0) with cutting-edge CUDA drivers.
 
+## Documentation
+
+General information goes to CLAUDE.md; information related to `vllm.sh` goes right into the script file (as comments).
+
+Documentation must be kept in sync and useful. Use terse language, avoid fluffy or chatty sections. Focus on the "why" if the "how" is obvious from looking at the code. Target audience is a coding agent such as yourself.
+
 ## Why a custom build?
 
 We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidia/vllm` container so we can track bleeding-edge vLLM (features/fixes ahead of any NVIDIA release) while keeping NVIDIA's Blackwell-tuned CUDA/PyTorch runtime. The official `vllm/vllm-openai:latest` image lags and its CUDA/torch combo isn't matched to the RTX 5090 + our driver, so a custom build is needed to reconcile NVIDIA's base torch with the newer vLLM source and its CUDA-extension deps.
@@ -56,11 +62,12 @@ The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's
 
 **Pinned to `transformers==5.12.1`** (bumped from 5.5.4 on 2026-07-02) to enable Gemma 4 MTP:
 
-- Gemma 4 MTP (Multi-Token Prediction) speculative decoding uses Google's drafter `google/gemma-4-31B-it-assistant` (~0.5B), enabled by `vllm.sh` config **`4m`** (same NVFP4 checkpoint as `4`, but with `--speculative-config` and a KV budget sized so the drafter weights fit at gpu-mem-util 0.982). **`vllm.sh`'s `4m` block is the source of truth for these numbers — it carries the full dated tuning log. Do not trust figures quoted here over that block.** Current: `CONTEXT_SIZE=105000` with `--num-gpu-blocks-override 6780`.
+- Gemma 4 MTP (Multi-Token Prediction) speculative decoding uses Google's drafter `google/gemma-4-31B-it-assistant` (~0.5B), enabled by `vllm.sh` configs **`4m`** (105k ctx) and **`4`** (the same stack at 90k ctx + a 24 GiB host-RAM KV tier; see below), with a KV budget sized so the drafter weights fit at gpu-mem-util 0.982. **`vllm.sh`'s `4m` block is the source of truth for these numbers — it carries the full dated tuning log. Do not trust figures quoted here over that block.** Current: `CONTEXT_SIZE=105000` with `--num-gpu-blocks-override 6780`.
   - **The tuning lever changed on 2026-08-03.** Before that, the KV pool was whatever vLLM's profiler handed out and the only lever was trimming `CONTEXT_SIZE` under it. Since then the pool is **pinned** by `--num-gpu-blocks-override`, deliberately claiming more than the profiler offers (the profiler under-estimates because the torch.compile working set is still resident when the peak is measured) and making warm and cold boots identical. So **re-tuning now means adjusting the block override, not just lowering context.**
   - **Both directions are load-bearing, and they fail differently.** Too few blocks → the old failure: KV cache too small at startup, engine won't boot. Too many → the pool eats the activation headroom and the engine **boots fine, serves for hours, then dies mid-request** with a CUDA OOM on a prefill buffer, which `--restart unless-stopped` silently masks as a restart. Check `RestartCount`, not just health.
   - History: ran **128k** until the 2026-07-17 vLLM update (Qwen 3.6 + new default kernels/cudagraphs) dropped the pool to ~6.86 GiB (~85k tokens) and 128k OOMed at startup → retuned to `83968`. Raised to **105000** on 2026-08-03 once the 7000-block override pinned the pool at 119,182 tokens. Override cut to **6780** on 2026-09-09 (115,437 tokens, 1.10x) after b21's larger non-KV footprint left only 154.88 MiB free and a 168 MiB prefill buffer began crashing the engine hours into serving.
   - **Re-derive after every image bump — this is routinely forgotten** (it was skipped across b18→b21, which is what caused the 2026-09-09 crashes). Boot cold, read `GPU KV cache size: <N> tokens`, and confirm real headroom via `nvidia-smi` — note the `gpu_worker.py:871` "kv cache memory in use" line reports the *profiled* figure, not the pinned pool, so it does not reflect the override. All of this is a `vllm.sh`-only fix; no image rebuild.
+  - **Config `4` has its own override (6400); never sync it to `4m`'s.** Its RAM KV tier forces it to run without expandable_segments, which costs ~500 MiB of headroom. Re-derive it separately after an image bump, using a long-prompt stress test rather than idle headroom. Details are in the `vllm.sh` `4` block.
 - The drafter's `config.json` has `model_type: gemma4_assistant`. vLLM does **not** register this in its config registry (true even on upstream main) — it relies on **transformers** to recognize it, and that model_type only landed in **transformers 5.12.x**. `5.7.0` does NOT have it (despite the drafter stamping `5.7.0.dev0`); with anything <5.12 the engine crashes at config load: "Transformers does not recognize `gemma4_assistant`".
 - Validated 2026-07-02: 5.12.1 boots cleanly against our wheel, preserves NVIDIA's torch, and drives the drafter at ~80–91% draft acceptance (mean accept length ~1.8 → near ~1.8× decode). MTP is text-only (drafter has no vision tower); image prompts still run on the target.
 
@@ -132,14 +139,3 @@ The base was moved from `26.03.post1` to `nvcr.io/nvidia/vllm:26.06-py3` (torch 
 Validated: b14 serves `vllm.sh 2` (Qwen NVFP4 MoE + MTP) end-to-end. `Dockerfile.26.03` archives the previous build; `PLAN-base-26.06.md` has the full audit/rationale.
 
 > **Reminder for the next base bump:** we track bleeding-edge vLLM source, so *any* fixed NVIDIA base will lag some deps — expect to keep a set of CUDA/kernel pins in the runtime stage no matter what. Trial in a separate `Dockerfile.<ver>`, diff shipped versions against `vllm/requirements/{common,cuda}.txt` (see `PLAN-base-26.06.md` step 0 for the audit snippet), and validate `vllm.sh 2` (the cute-DSL warmup path) before promoting.
-
-## issue.md — Bug Investigation Log
-
-`issue.md` in this directory is the **living investigation log** for a vLLM engine livelock bug (requests accumulate in waiting queue; engine never schedules them; no errors emitted).
-
-**Rules for Claude:**
-- **Always read `issue.md` at the start of any debugging session** for this bug to avoid re-treading covered ground.
-- **Always update `issue.md` before reporting findings** — write results there first, then summarize to the user.
-- **Append new investigation rounds** under a dated `## Round N — YYYY-MM-DD` heading; never overwrite prior rounds.
-- Sections to maintain: Hypotheses (ordered by confidence), What We Have Not Yet Tried, and a Findings table per round.
-- The file is the single source of truth; keep it complete enough that a fresh Claude session can pick up the investigation without this conversation.
