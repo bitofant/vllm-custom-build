@@ -15,7 +15,7 @@
 #   1  Qwen3.8-27B QAT-NVFP4      (110k ctx, bf16 KV; '1c'/'1k' = old unsloth PTQ)
 #   2  Qwen3.6-35B-A3B-NVFP4      (256k ctx, native MTP; custom image)
 #   3  DeepSeek-R1-Distill-32B-AWQ(32k ctx)
-#   4  Gemma-4-31B-IT-NVFP4       (nvidia, tiny ctx; '4m'/'4f' RedHatAI+MTP, '4mc' turbo text)
+#   4  Gemma-4-31B-IT-NVFP4       (RedHatAI+MTP, 90k ctx + 24GB RAM KV tier; '4m' 105k no RAM tier, '4f' fp4 KV, '4mc' turbo text)
 #   5  Nemotron-3.5-Lightning-30B-A3B-NVFP4 (Mamba/MoE hybrid, native MTP)
 #
 # Control verbs are WORDS, never numbers. The old numeric 5/6/7 (logs/test/stop)
@@ -304,7 +304,7 @@ function rec_config_for_container() {
     vllm_qwen_3_8_bf16kv)        echo "1k" ;;
     vllm_qwen3_6_35b_a3b_nvfp4)  echo "2" ;;
     vllm_deepseek_r1_32b_awq)    echo "3" ;;
-    vllm_gemma4-31b-nvfp4)       echo "4" ;;
+    vllm_gemma4-31b-nvfp4-mtp-ram) echo "4" ;;
     vllm_gemma4-31b-nvfp4-mtp)   echo "4m" ;;
     vllm_gemma4-31b-nvfp4-mtp-hc) echo "4mc" ;;
     vllm_gemma4-31b-nvfp4-mtp-fp4kv) echo "4f" ;;
@@ -334,7 +334,8 @@ function vllm() {
   local REC_INFERRED=
   local REC_YES=
   local REC_REPLY=
-  # Per-config extra `docker run` env flags (e.g. --env VLLM_ATTENTION_BACKEND=...).
+  # Per-config extra `docker run` flags (e.g. --env VLLM_ATTENTION_BACKEND=...,
+  # --ulimit memlock=-1:-1) — spliced raw into `docker run`, not just env vars.
   # Default empty; a case branch below may set it. Baked into the container at
   # create time, so the stopped-container restart path inherits it automatically.
   local ENV_ARGS=()
@@ -397,10 +398,10 @@ function vllm() {
     echo -e "   ${GRAY}32k context | ~74 tok/s | no offloading${RESET}"
     echo -e "   ${GRAY}R1 distilled reasoning model (shows <think> tags)${RESET}"
     echo ""
-    echo -e "${BOLD}4)${RESET} ${CYAN}Gemma-4-31B-IT-NVFP4 (nvidia)${RESET}"
-    echo -e "   ${GRAY}8k context | fp8 KV cache | barely fits 32GB (attn stays bf16)${RESET}"
-    echo -e "   ${GRAY}Gemma 4 IT, nvidia NVFP4 (modelopt), multimodal (Blackwell)${RESET}"
-    echo -e "   ${GRAY}(use '4m' for MTP spec-decode, '4mc' for text-only Turbo high-context,${RESET}"
+    echo -e "${BOLD}4)${RESET} ${CYAN}Gemma-4-31B-IT-NVFP4 (RedHatAI) + MTP + RAM KV tier${RESET}"
+    echo -e "   ${GRAY}90k context (1.12x concurrency) | fp8 KV | 24GB host-RAM prefix cache${RESET}"
+    echo -e "   ${GRAY}Gemma 4 IT, compressed-tensors NVFP4, multimodal, Google MTP drafter${RESET}"
+    echo -e "   ${GRAY}(use '4m' for 105k ctx without the RAM tier, '4mc' for text-only Turbo high-context,${RESET}"
     echo -e "   ${GRAY} '4f' for MTP + NVFP4 KV cache)${RESET}"
     echo ""
     echo -e "${BOLD}5)${RESET} ${CYAN}Nemotron-3.5-Lightning-30B-A3B-NVFP4${RESET}"
@@ -642,34 +643,114 @@ function vllm() {
       EXTRA=(--enable-prefix-caching)
       ;;
     4)
-      # nvidia's official NVFP4 checkpoint (modelopt_fp4, NOT compressed-tensors).
-      # Unlike RedHatAI (used by 4m/4f), it keeps all 60 self_attn layers plus
-      # vision/embed/lm_head at bf16, so the weights alone load to ~30.5 GB and do
-      # NOT fit the 5090's 32 GB with room for KV/activations — hence tiny context,
-      # no MTP, and a minimal prefill reservation (--max-num-batched-tokens 2560 is
-      # the image floor from Gemma 4's bidirectional MM attention; --max-num-seqs 1).
-      # CPU_OFFLOAD=4 is REQUIRED: without it the run OOM-crash-loops during weight
-      # loading (torch.empty for qkv_proj fails with ~192 MiB free — the card is
-      # genuinely full of weights, so expandable_segments has nothing to reclaim and
-      # shrinking CONTEXT_SIZE can't help since the OOM is pre-KV). Spilling ~4 GB of
-      # weights to RAM leaves headroom for KV + the flashinfer fp4 autotune transient;
-      # inference is slower (PCIe-bound). '4mc' (text-only turbo) is a lighter,
-      # offload-free alternative. Needs vllm-custom:latest for SM120 NVFP4. Re-derive
-      # CONTEXT_SIZE from the "GPU KV cache size: N tokens" log line — 8192 is a safe
-      # starting point. (2026-07-22)
-      MODEL_ID="nvidia/Gemma-4-31B-IT-NVFP4"
-      QUANTIZATION="modelopt_fp4"
-      CONTEXT_SIZE=8192
+      # 4m's stack (RedHatAI NVFP4 + Google MTP drafter + fp8 KV + a pinned block
+      # pool + autotune skip) at 90k ctx, plus a 24 GiB host-RAM prefix-cache
+      # tier. Everything in 4m's comment block applies here too — in particular,
+      # re-derive --num-gpu-blocks-override from a COLD boot after ANY image bump.
+      # This override is DELIBERATELY LOWER than 4m's (6400 vs 6780) and must NOT
+      # be synced to it: this config runs without expandable_segments (see below).
+      # (2026-09-10: replaced the old nvidia/Gemma-4-31B-IT-NVFP4 CPU_OFFLOAD=4
+      # config, whose weights barely fit the card — recover it from git history.)
+      #
+      # STATUS: VALIDATED at 6400 blocks (b21, 2026-09-10). Cold boot 83s,
+      # 101,088 tokens (1.12x @ 90k), idle 30,784 MiB, 19,660 CPU blocks / 24 GB
+      # pinned. Three stress passes (~87k-token prompt + 2 concurrent ~38k
+      # prompts + reload) peaked at 31,870 MiB with 0 OOM / 0 restarts. RAM-tier
+      # reload of an evicted 87,724-token prompt: 87,680 tokens served from RAM,
+      # 0.3s vs 47.6s re-prefill. Correctness: needle test (~60k prompt; answer
+      # from computed KV vs from RAM-reloaded KV) matched exactly.
+      #
+      # History — at 6780 (4m's value) it FAILED: booted fine (idle 31,260 MiB)
+      # but the first ~86k-token prompt killed the engine with the SAME 168 MiB
+      # prefill-buffer OOM as 4m's 2026-09-09 crash
+      # (buf7 = empty_strided_cuda((4096, 21504)), 142.88 MiB free), which
+      # --restart unless-stopped then masked. The OOM report showed 508 MiB
+      # "reserved by PyTorch but unallocated" — fragmentation expandable_segments
+      # would reclaim, and which idle nvidia-smi does NOT reveal. Dropping
+      # expandable_segments (forced, see below) costs ~500 MiB of real headroom;
+      # 6780 -> 6400 hands back 380 blocks x ~1.22 MiB ~= 476 MiB measured (6780
+      # was only ~25 MiB short, but fragmentation without expandable_segments
+      # isn't deterministic, so the margin is deliberately wide).
+      #
+      # Re-validate after ANY change with the long-prompt stress test (cold boot,
+      # ~88k prompt, 2 concurrent ~38k prompts, RAM reload, RestartCount) — idle
+      # headroom alone proved nothing here. If trimming ever stops being enough:
+      # patch the image so the Gemma 4 drafter config keeps
+      # enable_cumem_allocator, then restore expandable_segments +
+      # --enable-cumem-allocator.
+      #
+      # CONTEXT_SIZE 90000 (vs 4m's 105000) for 2nd-sequence headroom. MEASURED
+      # (b21, 2026-09-10): 6400 blocks -> 101,088 tokens, 1.12x at 90k (4m: 1.10x
+      # at 105k). The same 6780 blocks reported 107,090 tokens here vs 115,437 in
+      # 4m — for this hybrid sliding-window model the token figure depends on
+      # max_model_len, so ratios don't carry over between configs. Read the
+      # "GPU KV cache size" boot line.
+      # CONTEXT_SIZE (and the kv-transfer config) are in the torch.compile cache
+      # key -> the first boot recompiles.
+      #
+      # RAM TIER (SimpleCPUOffloadConnector, 24 GiB). A second prefix-cache tier,
+      # NOT extra context: attention only reads GPU KV, so max context is still
+      # bound by the GPU pool. GPU-evicted blocks land in pinned host RAM, and a
+      # later request with the same prefix reloads over PCIe instead of
+      # re-prefilling. Pays off when rotating between long conversations (one 90k
+      # conversation fills most of the pool) and on preemption recovery. Eager
+      # mode (default): blocks are copied D2H as they're computed, so they're
+      # already in RAM when evicted. GPU cost ~0 — the connector adds two CUDA
+      # streams and views over the existing KV tensors; the 24 GiB is a CPU
+      # tensor pinned via cudaHostRegister. (The 6780 -> 6400 retune below comes
+      # from losing expandable_segments, not from the connector itself.)
+      #
+      # CAVEAT — a prefix reaches RAM only from its 2nd sighting. On this model a
+      # prompt's blocks only become reusable the SECOND time it is seen (sends 1
+      # and 2 miss, send 3 hits — identical on 4m with no connector, so this is
+      # upstream Gemma 4 hybrid-cache behaviour, not this config). The connector
+      # skips unhashed GPU blocks (simple_kv_offload/manager.py
+      # `block_hash is None`), so a prefix seen only once never reaches RAM.
+      # Multi-turn chat re-sends the history every turn, so earlier turns
+      # qualify quickly; a one-off long prompt never will.
+      #
+      # SIZING: MEASURED 19,660 CPU blocks for 24 GiB — bytes / bytes-per-block,
+      # so independent of the GPU override — ~3.1x the 6400-block GPU pool
+      # (~310k tokens, ~3.4 full 90k contexts). Host RAM "used" went 5 -> 34 GB
+      # at boot. Pinned memory is unswappable and invisible to the page cache;
+      # 24 of 91 GB leaves ~55 GB for the OS, the vLLM process, and page cache
+      # for the ~20 GB of weight files (fast restarts). 16 GiB ~= 2x the pool,
+      # 32 GiB ~= 4x. Figure: "SimpleCPUOffloadScheduler: Allocating N offload
+      # blocks" boot line.
+      #
+      # Two deliberate deviations from 4m, both forced by the connector:
+      # * NO PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True. vLLM REJECTS any KV
+      #   connector while it is set (config/vllm.py _verify_kv_transfer_compat:
+      #   VMM remaps would invalidate pinned KV). The documented exemption,
+      #   --enable-cumem-allocator, does NOT work with Gemma 4 MTP: the drafter's
+      #   VllmConfig is rebuilt from the draft ModelConfig
+      #   (v1/worker/gpu/spec_decode/gemma4/speculator.py _create_draft_vllm_config),
+      #   which drops enable_cumem_allocator, so the check re-fires and engine init
+      #   dies with "KV connector SimpleCPUOffloadConnector is incompatible with
+      #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" (tried 2026-09-10;
+      #   still unfixed on upstream main). expandable_segments was 4m's 2026-07-22
+      #   lever for the (since-disabled) flashinfer autotune transient; 4m's
+      #   headroom was measured WITH it, so this config's headroom is measured
+      #   separately (see STATUS). If upstream fixes the drafter config, cumem +
+      #   expandable_segments becomes an option again.
+      # * --ulimit memlock=-1:-1 (in ENV_ARGS): the container's default memlock
+      #   soft limit is 8 MB, and this connector's pin_tensor() RAISES on a
+      #   cudaHostRegister failure (no unpinned fallback). Whether the driver
+      #   enforces RLIMIT_MEMLOCK there is driver-dependent; this rules it out.
+      MODEL_ID="RedHatAI/gemma-4-31B-it-NVFP4"
+      QUANTIZATION="compressed-tensors"
+      CONTEXT_SIZE=90000
       INPUT_MODES="text,image"
-      DOCKER_NAME="vllm_gemma4-31b-nvfp4"
+      DOCKER_NAME="vllm_gemma4-31b-nvfp4-mtp-ram"
       DOCKER_IMAGE="vllm-custom:latest"
-      CPU_OFFLOAD=4
-      GPU_MEM_UTIL=0.983
-      ENV_ARGS=(--env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 2560 --max-num-seqs 1 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja)
+      CPU_OFFLOAD=0
+      GPU_MEM_UTIL=0.982
+      ENV_ARGS=(--ulimit memlock=-1:-1)
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
       ;;
     4m)
-      # Option 4 + MTP speculative decoding via Google's drafter
+      # RedHatAI Gemma 4 31B NVFP4 + MTP speculative decoding via Google's drafter
+      # (option 4 is now this same stack at 90k ctx + a host-RAM KV tier)
       # google/gemma-4-31B-it-assistant (~0.5B, model_type gemma4_assistant which
       # vLLM rewrites to gemma4_mtp; n_predict forced to 1). Drafter shares the
       # target KV cache, so ~1 GB extra weights only.
