@@ -118,9 +118,21 @@ There is **no `hf` or `huggingface-cli` on PATH**, so removal is `rm -rf` of the
 Build the referenced set first (`org/name` maps to `models--org--name`):
 
 ```bash
-grep -oP 'MODEL_ID="\K[^"]+' ~/scripts/vllm.sh          # target models
-grep -oP '"model":"\K[^"]+' ~/scripts/vllm.sh           # MTP drafters
+grep -oP 'MODEL_ID="\K[^"]+' ~/src/vllm/vllm.sh         # target models
+grep -oP '"model":"\K[^"]+' ~/src/vllm/vllm.sh          # MTP drafters
 du -sh ~/.cache/huggingface/hub/* | sort -rh            # what is on disk
+```
+
+(Grep `~/src/vllm/vllm.sh` — the alias points there. `~/scripts/vllm.sh` is a stale copy.)
+
+**Older `models--*` dirs are owned by root**, because the weights were downloaded by the
+container (which runs as root) into the bind-mounted cache. A plain `rm -rf` as `joran` then
+fails with "Permission denied" on every blob. Delete through a container instead of reaching
+for sudo — same image, no extra download:
+
+```bash
+docker run --rm -v ~/.cache/huggingface:/hf --entrypoint rm vllm-custom:latest \
+  -rf /hf/hub/models--<org>--<name>
 ```
 
 **Absence from `vllm.sh` does not mean unused.** Other stacks pull their own models and are
