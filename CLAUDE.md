@@ -73,6 +73,23 @@ The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's
 
 **The 26.06 base does NOT fix this** — it ships **transformers 5.6.0** (below 5.12.1, no `gemma4_assistant`), so the explicit `transformers==5.12.1` pin is still required after the base bump. (The base bump itself was done on 2026-07-17 and did retire the nvcc override / `cuda_view.cu` / hoist patches — see "Dockerfile strategy" above — but the transformers pin is independent of the base and stays.)
 
+## DiffusionGemma (`vllm.sh` `3` / `3n`) — the one config with a constrained *request* shape
+
+Added 2026-09-22, replacing the DeepSeek-R1-Distill-32B-AWQ config. Both validated on b22: `3` = `RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic` (20k ctx, 385 tok/s mean, 8.0 steps/canvas) and `3n` = `nvidia/diffusiongemma-26B-A4B-it-NVFP4` (**131k ctx, 444 tok/s mean, 9.8 steps/canvas** — faster *and* 6× the context, so prefer `3n` unless you specifically want the checkpoint upstream evaluates). **The `3|3n` block in `vllm.sh` is the source of truth** for flags and sizing; only the facts that outlive a retune are repeated here. No image work was needed — b22 already builds `diffusion_gemma.py`.
+
+Every other config here is autoregressive; this one denoises a 256-token canvas per step. Two consequences worth knowing before touching anything:
+
+- **Requests are validated differently.** vLLM 400s `temperature != 1.0`, `seed`, `min_p`, `min_tokens`, `logit_bias`, `bad_words`, `allowed_token_ids` (`sampling_params.py` `_validate_diffusion`) and all structured outputs / `response_format` — which also rules out `tool_choice: "required"` or a named function. `--enable-auto-tool-choice` is fine (text parsing). `vllm test` and `bench-inference.ts` were fixed in the same change to stop sending an explicit temperature; **any other client that sends one will fail against these two configs only.** That includes whatever `sync_agent_models` points pi/OpenClaw at.
+- **Never add `--speculative-config`.** `canvas_length` *is* `num_speculative_tokens` for this model (`config/vllm.py`), and a spec config silently overrides it.
+
+Two traps for a future image bump:
+
+- **Attention backend.** The model passes a per-request causal *tensor*; only TRITON_ATTN and FA4 handle it, and FlashInfer is hard-rejected. On sm_120 FA falls back to FA2 (FA4 is auto-selected only for capability major 10), so the configs pass `--attention-backend TRITON_ATTN` explicitly rather than trusting the Gemma 4 auto-fallback. Upstream validates the mixed-causal kernels on SM90/SM100 only — this box is not covered by their CI.
+- **Memory is tight on the FP8 variant, and the lever is not the obvious one.** Measured on b22: weights 25.86 GiB, KV 68–95 KiB/token (it is *not* cheap — the 25 sliding layers draw from the same pool as the 5 full-attention ones, so the 1024-token window does not bound it). NVFP4 is ~17.5 GiB instead, because modelopt quantized **only the MoE experts** (attention, dense MLPs, router, vision tower and lm_head stay bf16) — don't expect a 4× shrink there either.
+  - The KV pool always expands to fill `util × TOTAL`, so **lowering `CONTEXT_SIZE` alone frees nothing**; utilization (or `--num-gpu-blocks-override`) is the lever, exactly as for configs 4/4m.
+  - What warmup needs lives in the gap *outside* that budget, and on this model it is large: the diffusion sampler materializes `[seqs, canvas, vocab]` fp32 buffers, i.e. **268 MiB per sequence per buffer**. `--max-num-seqs 1` is load-bearing, not a default — with 2, this config OOMed in inductor autotune at 0.95 *and* 0.93 utilization.
+  - This box also has a permanent ~500 MiB GPU resident (the `laya` container), which caps utilization at ~0.967 before vLLM's startup free-memory check refuses to boot at all. **Configs `4`/`4m` are pinned at 0.982 and would hit that same check on a cold boot while laya holds its allocation** — they work today only because laya allocates lazily.
+
 ## Building
 
 > **Routine update + build:** run `./update.sh` — it fast-forwards `vllm/` to upstream `main` (aborts on a non-fast-forward or a dirty tree; never forces), reports the version delta, and starts a detached build. Pass `--no-build` to update only. It does **not** block on the build and does **not** diagnose failures — a large upstream jump can break a grep-guarded Dockerfile patch or pin, which needs a human/agent (the `/latest` skill covers watch-and-fix).

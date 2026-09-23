@@ -17,6 +17,17 @@
  * scrapes the Prometheus /metrics endpoint before/after to report draft
  * acceptance rate and mean accept length.
  *
+ * DIFFUSION MODELS (vllm.sh `3`/`3n`, DiffusionGemma) are handled specially, in
+ * two ways. (1) They reject any explicit temperature — the denoiser owns its own
+ * schedule — so the usual `temperature: 0.0` is dropped for them, and ONLY for
+ * them, so the existing history stays comparable. (2) They expose
+ * `vllm:diffusion_*` counters instead of `vllm:spec_decode_*`, so the acceptance
+ * block is replaced by denoising steps per canvas / committed tokens per step
+ * (same arithmetic as upstream's `vllm bench serve`). (3) Decode tok/s is
+ * reported as n/a for them and the tables fall back to end-to-end tok/s: a
+ * canvas commits in ONE streamed chunk, so TTFT ~ total time and the usual
+ * (tokens)/(total - ttft) blows up (measured: 2.4M "tok/s").
+ *
  * Every run appends one JSON record to `bench-results/bench.jsonl` (gitignored)
  * so numbers can be compared across builds; `--report` renders that history as a
  * table instead of running a benchmark.
@@ -133,7 +144,15 @@ interface SpecMetrics {
   accepted: number;
 }
 
-async function scrapeSpecMetrics(host: string): Promise<SpecMetrics | null> {
+interface DiffusionMetrics {
+  steps: number;
+  positions: number;
+  committed: number;
+}
+
+// Returns a lookup over the server's Prometheus text, or null if /metrics is
+// unreachable. Both scrapers below share it so they agree on the parse.
+async function metricGrabber(host: string): Promise<((metric: string) => number | null) | null> {
   let text: string;
   try {
     const r = await fetch(`http://${host}/metrics`);
@@ -141,11 +160,32 @@ async function scrapeSpecMetrics(host: string): Promise<SpecMetrics | null> {
   } catch {
     return null;
   }
-  const grab = (metric: string): number | null => {
-    const re = new RegExp(`^${metric.replace(/[:]/g, "\\$&")}\\{[^}]*}\\s+([0-9.eE+-]+)`, "m");
+  // `(?:_total)?` because Prometheus appends _total to counter names on
+  // exposition: vLLM registers `vllm:diffusion_num_denoising_steps` but serves
+  // `vllm:diffusion_num_denoising_steps_total`. The spec names below already
+  // carry the suffix, and the optional group leaves them matching as before.
+  return (metric: string): number | null => {
+    const re = new RegExp(`^${metric.replace(/[:]/g, "\\$&")}(?:_total)?\\{[^}]*}\\s+([0-9.eE+-]+)`, "m");
     const m = text.match(re);
     return m ? parseFloat(m[1]) : null;
   };
+}
+
+// Presence of these counters IS the diffusion detector: no endpoint reports
+// whether a model is a dLLM, and only diffusion models register them.
+async function scrapeDiffusionMetrics(host: string): Promise<DiffusionMetrics | null> {
+  const grab = await metricGrabber(host);
+  if (grab === null) return null;
+  const steps = grab("vllm:diffusion_num_denoising_steps");
+  const positions = grab("vllm:diffusion_num_canvas_positions");
+  const committed = grab("vllm:diffusion_num_committed_tokens");
+  if (steps === null || positions === null || committed === null) return null;
+  return { steps, positions, committed };
+}
+
+async function scrapeSpecMetrics(host: string): Promise<SpecMetrics | null> {
+  const grab = await metricGrabber(host);
+  if (grab === null) return null;
   const drafts = grab("vllm:spec_decode_num_drafts_total");
   const draftTokens = grab("vllm:spec_decode_num_draft_tokens_total");
   const accepted = grab("vllm:spec_decode_num_accepted_tokens_total");
@@ -171,26 +211,51 @@ function deltaText(delta: any): string {
   return delta?.content || delta?.reasoning || delta?.reasoning_content || "";
 }
 
-async function runPrompt(host: string, model: string, prompt: string, maxTokens: number): Promise<Result> {
-  const body = JSON.stringify({
+// Set once, either by the /metrics probe in main() or by the 400 retry below.
+// Diffusion models 400 on ANY temperature != 1.0 (vLLM's _validate_diffusion);
+// every other model keeps the greedy 0.0 this benchmark has always used, so
+// bench.jsonl history stays comparable.
+let isDiffusion = false;
+
+function chatBody(model: string, prompt: string, maxTokens: number): string {
+  const body: Record<string, unknown> = {
     model,
     messages: [{ role: "user", content: prompt }],
     max_tokens: maxTokens,
-    temperature: 0.0,
     stream: true,
     stream_options: { include_usage: true },
-  });
+  };
+  if (!isDiffusion) body.temperature = 0.0;
+  return JSON.stringify(body);
+}
+
+async function runPrompt(host: string, model: string, prompt: string, maxTokens: number): Promise<Result> {
+  const post = () =>
+    fetch(`http://${host}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: chatBody(model, prompt, maxTokens),
+    });
+
   const tStart = performance.now();
   let ttft: number | null = null;
   let completionTokens = 0;
   let sawContent = false;
   let finishReason: string | null = null;
 
-  const resp = await fetch(`http://${host}/v1/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body,
-  });
+  let resp = await post();
+  // Belt-and-braces for the /metrics probe: if this server turns out to be a
+  // diffusion model after all (counters not yet registered, say), the rejection
+  // names the offending params — drop the temperature and retry once.
+  if (resp.status === 400 && !isDiffusion) {
+    const detail = await resp.text();
+    if (/diffusion/i.test(detail)) {
+      isDiffusion = true;
+      resp = await post();
+    } else {
+      throw new Error(`HTTP 400: ${detail}`);
+    }
+  }
   if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
 
   const reader = resp.body.getReader();
@@ -224,8 +289,14 @@ async function runPrompt(host: string, model: string, prompt: string, maxTokens:
   // No clamped floor here: if TTFT is missing the decode window is unknowable,
   // and a fabricated 0 tok/s reads as broken rather than as a 1e9 tok/s "result".
   const decodeTime = ttft === null ? 0 : total - ttft;
+  // Diffusion models have NO separable decode phase to measure: a canvas is
+  // committed as one streamed chunk, so the first delta already carries ~256
+  // tokens and (total - ttft) collapses toward zero. Computing tok/s from it
+  // yields garbage — measured 2026-09-22 on DiffusionGemma: 205,032 to
+  // 2,433,438 "decode tok/s". Report it as n/a and use total tok/s, which is
+  // the honest comparable number for this decoding regime.
   const decodeTps =
-    ttft !== null && completionTokens > 1 && decodeTime > 0
+    !isDiffusion && ttft !== null && completionTokens > 1 && decodeTime > 0
       ? (completionTokens - 1) / decodeTime
       : 0;
   const totalTps = total > 0 ? completionTokens / total : 0;
@@ -252,6 +323,13 @@ interface Aggregate {
   decodeTpsMax: number | null;
   ttftMean: number | null;
   ttftMedian: number | null;
+  /**
+   * End-to-end tokens/second (completion tokens / wall time), including TTFT.
+   * Absent on records written before 2026-09-22. This is the ONLY throughput
+   * figure diffusion runs have — see the decodeTps note in runPrompt.
+   */
+  totalTpsMean?: number | null;
+  totalTpsMedian?: number | null;
   completionTokens: number;
 }
 
@@ -261,6 +339,44 @@ interface SpecSummary {
   accepted: number;
   acceptRate: number;
   acceptLen: number;
+}
+
+/**
+ * Diffusion decoding, this run. Derived exactly the way upstream's
+ * `vllm bench serve` does it (vllm/benchmarks/serve.py), so numbers are
+ * comparable with it: the canvas length falls out of positions/steps, the
+ * number of canvases out of committed/canvasLength, and the commit steps are
+ * then excluded from the denoising-step count.
+ */
+interface DiffusionSummary {
+  denoisingSteps: number;
+  canvasLength: number;
+  canvases: number;
+  committedTokens: number;
+  stepsPerCanvas: number;
+  committedPerStep: number;
+}
+
+function summarizeDiffusion(
+  before: DiffusionMetrics,
+  after: DiffusionMetrics,
+): DiffusionSummary | null {
+  const dSteps = after.steps - before.steps;
+  const dPositions = after.positions - before.positions;
+  const dCommitted = after.committed - before.committed;
+  if (!(dSteps > 0 && dCommitted > 0)) return null;
+  const canvasLength = dPositions / dSteps;
+  const canvases = dCommitted / canvasLength;
+  const denoisingSteps = dSteps - canvases;
+  if (!(denoisingSteps > 0 && canvases > 0)) return null;
+  return {
+    denoisingSteps,
+    canvasLength,
+    canvases,
+    committedTokens: dCommitted,
+    stepsPerCanvas: denoisingSteps / canvases,
+    committedPerStep: dCommitted / denoisingSteps,
+  };
 }
 
 interface BenchRecord {
@@ -279,12 +395,20 @@ interface BenchRecord {
   results: Result[];
   aggregate: Aggregate;
   spec: SpecSummary | null;
+  /**
+   * Diffusion decoding stats, or null/absent for autoregressive models. Records
+   * written before 2026-09-22 predate diffusion support and lack the field.
+   */
+  diffusion?: DiffusionSummary | null;
 }
 
 function summarize(results: Result[]): Aggregate {
   const decs = results.map((r) => r.decodeTps).filter((x) => x > 0);
+  const tots = results.map((r) => r.totalTps).filter((x) => x > 0);
   const ttfts = results.map((r) => r.ttft).filter((x): x is number => x !== null);
   return {
+    totalTpsMean: tots.length ? mean(tots) : null,
+    totalTpsMedian: tots.length ? median(tots) : null,
     decodeTpsMean: decs.length ? mean(decs) : null,
     decodeTpsMedian: decs.length ? median(decs) : null,
     decodeTpsMin: decs.length ? Math.min(...decs) : null,
@@ -357,17 +481,31 @@ function report(): void {
     console.log(`No saved results in ${RESULTS_FILE}`);
     return;
   }
-  const rows = records.map((r) => ({
+  // Diffusion rows have no decode-phase figure, so they fall back to end-to-end
+  // tok/s, marked with * and explained under the table. Never silently mix the
+  // two in one column — they are not the same measurement.
+  let sawTotalFallback = false;
+  const rows = records.map((r) => {
+    const useTotal = r.aggregate?.decodeTpsMean == null && r.aggregate?.totalTpsMean != null;
+    if (useTotal) sawTotalFallback = true;
+    return {
     when: formatLocalTs(r.ts),
     tag: r.tag ?? r.serverVersion ?? "-",
     model: r.model.length > 34 ? r.model.slice(0, 33) + "…" : r.model,
-    mean: fmt(r.aggregate?.decodeTpsMean, 1),
-    med: fmt(r.aggregate?.decodeTpsMedian, 1),
+    mean: useTotal ? fmt(r.aggregate?.totalTpsMean, 1) + "*" : fmt(r.aggregate?.decodeTpsMean, 1),
+    med: useTotal ? fmt(r.aggregate?.totalTpsMedian, 1) + "*" : fmt(r.aggregate?.decodeTpsMedian, 1),
     min: fmt(r.aggregate?.decodeTpsMin, 1),
     max: fmt(r.aggregate?.decodeTpsMax, 1),
     ttft: fmt(r.aggregate?.ttftMedian, 3),
-    acc: r.spec ? `${r.spec.acceptLen.toFixed(2)}x` : "-",
-  }));
+    // One column, two regimes: MTP runs report mean accept length, diffusion
+    // runs report denoising steps per canvas. A server never has both.
+    acc: r.spec
+      ? `${r.spec.acceptLen.toFixed(2)}x`
+      : r.diffusion
+        ? `${r.diffusion.stepsPerCanvas.toFixed(1)} st/c`
+        : "-",
+    };
+  });
 
   const cols: [string, keyof (typeof rows)[0], "l" | "r"][] = [
     ["when (local)", "when", "l"],
@@ -378,7 +516,7 @@ function report(): void {
     ["min", "min", "r"],
     ["max", "max", "r"],
     ["TTFT med", "ttft", "r"],
-    ["accept", "acc", "r"],
+    ["accept|denoise", "acc", "r"],
   ];
   const width = (head: string, key: keyof (typeof rows)[0]) =>
     Math.max(head.length, ...rows.map((r) => r[key].length));
@@ -390,6 +528,12 @@ function report(): void {
   console.log(line(cols.map(([h]) => h)));
   console.log("-".repeat(widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1)));
   for (const r of rows) console.log(line(cols.map(([, key]) => r[key])));
+  if (sawTotalFallback) {
+    console.log(
+      "\n* end-to-end tok/s (diffusion: a canvas commits in one chunk, so there is\n" +
+      "  no decode phase to measure separately); min/max read n/a for those rows.",
+    );
+  }
 }
 
 async function main() {
@@ -402,6 +546,14 @@ async function main() {
   const serverVersion = await detectServerVersion(args.host);
   const versionNote = serverVersion ? `  vLLM ${serverVersion}` : "";
   console.log(`Benchmarking  ${model}  @ ${args.host}  (max_tokens=${args.maxTokens})${versionNote}\n`);
+
+  // Probe for diffusion BEFORE the warmup request: the warmup is a real request
+  // and would be the first thing to 400 on an explicit temperature.
+  const diffusionBefore = await scrapeDiffusionMetrics(args.host);
+  if (diffusionBefore !== null) {
+    isDiffusion = true;
+    console.log("diffusion model detected — sending no explicit temperature\n");
+  }
 
   // Warm up before the spec-metrics baseline, so the throwaway's draft tokens
   // are not counted in the acceptance rate reported at the end.
@@ -418,6 +570,9 @@ async function main() {
   }
 
   const specBefore = await scrapeSpecMetrics(args.host);
+  // Re-read after the warmup so its canvases don't count toward this run
+  // (the probe above was for detection only).
+  const diffBefore = diffusionBefore === null ? null : await scrapeDiffusionMetrics(args.host);
 
   const results: Result[] = [];
   const header =
@@ -447,6 +602,7 @@ async function main() {
   }
 
   const specAfter = await scrapeSpecMetrics(args.host);
+  const diffAfter = diffBefore === null ? null : await scrapeDiffusionMetrics(args.host);
 
   const agg = summarize(results);
   if (results.length) {
@@ -456,6 +612,12 @@ async function main() {
       console.log(
         `  decode tok/s   mean ${fmt(agg.decodeTpsMean, 1)}   median ${fmt(agg.decodeTpsMedian, 1)}` +
         `   min ${fmt(agg.decodeTpsMin, 1)}   max ${fmt(agg.decodeTpsMax, 1)}`,
+      );
+    }
+    if (agg.totalTpsMean != null) {
+      console.log(
+        `  total tok/s    mean ${fmt(agg.totalTpsMean, 1)}   median ${fmt(agg.totalTpsMedian, 1)}` +
+        (isDiffusion ? "   (no separable decode phase — canvas-committed)" : ""),
       );
     }
     if (agg.ttftMean !== null) {
@@ -482,8 +644,26 @@ async function main() {
     } else {
       console.log("  (no draft tokens recorded this run)");
     }
-  } else if (specAfter === null) {
+  } else if (specAfter === null && diffBefore === null) {
     console.log("\n(no speculative-decode metrics exposed — server likely running without MTP)");
+  }
+
+  let diffusion: DiffusionSummary | null = null;
+  if (diffBefore && diffAfter) {
+    diffusion = summarizeDiffusion(diffBefore, diffAfter);
+    console.log("\nBlock diffusion — this run:");
+    if (diffusion) {
+      console.log(`  canvas length         : ${diffusion.canvasLength.toFixed(0)}`);
+      console.log(`  canvases committed    : ${diffusion.canvases.toFixed(1)}`);
+      console.log(`  committed tokens      : ${Math.round(diffusion.committedTokens)}`);
+      console.log(`  denoising steps/canvas: ${diffusion.stepsPerCanvas.toFixed(1)}  (cap 48)`);
+      console.log(
+        `  tokens per step       : ${diffusion.committedPerStep.toFixed(2)}` +
+        `  (~${diffusion.committedPerStep.toFixed(2)}x an autoregressive step)`,
+      );
+    } else {
+      console.log("  (no denoising steps recorded this run)");
+    }
   }
 
   // Persist last: a failed append should not cost the numbers already printed.
@@ -499,6 +679,7 @@ async function main() {
       results,
       aggregate: agg,
       spec,
+      diffusion,
     };
     try {
       saveRecord(rec);

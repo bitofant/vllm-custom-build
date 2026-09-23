@@ -14,7 +14,7 @@
 # Menu (see the case statement for per-config details & quantization notes):
 #   1  Qwen3.8-27B QAT-NVFP4      (110k ctx, bf16 KV; '1c'/'1k' = old unsloth PTQ)
 #   2  Qwen3.6-35B-A3B-NVFP4      (256k ctx, native MTP; custom image)
-#   3  DeepSeek-R1-Distill-32B-AWQ(32k ctx)
+#   3  DiffusionGemma-26B-A4B FP8   (20k ctx, block diffusion; '3n' = NVFP4)
 #   4  Gemma-4-31B-IT-NVFP4       (RedHatAI+MTP, 90k ctx + 24GB RAM KV tier; '4m' 105k no RAM tier, '4f' fp4 KV, '4mc' turbo text)
 #   5  Nemotron-3.5-Lightning-30B-A3B-NVFP4 (Mamba/MoE hybrid, native MTP)
 #
@@ -303,7 +303,8 @@ function rec_config_for_container() {
     vllm_qwen_3_8_228k)          echo "1c" ;;
     vllm_qwen_3_8_bf16kv)        echo "1k" ;;
     vllm_qwen3_6_35b_a3b_nvfp4)  echo "2" ;;
-    vllm_deepseek_r1_32b_awq)    echo "3" ;;
+    vllm_diffusiongemma_26b_fp8) echo "3" ;;
+    vllm_diffusiongemma_26b_nvfp4) echo "3n" ;;
     vllm_gemma4-31b-nvfp4-mtp-ram) echo "4" ;;
     vllm_gemma4-31b-nvfp4-mtp)   echo "4m" ;;
     vllm_gemma4-31b-nvfp4-mtp-hc) echo "4mc" ;;
@@ -394,9 +395,10 @@ function vllm() {
     echo -e "   ${GRAY}256k context | MTP spec-decode | no offloading${RESET}"
     echo -e "   ${GRAY}Qwen 3.6 MoE model (NVFP4), strong reasoning${RESET}"
     echo ""
-    echo -e "${BOLD}3)${RESET} ${CYAN}DeepSeek-R1-Distill-Qwen-32B-AWQ${RESET}"
-    echo -e "   ${GRAY}32k context | ~74 tok/s | no offloading${RESET}"
-    echo -e "   ${GRAY}R1 distilled reasoning model (shows <think> tags)${RESET}"
+    echo -e "${BOLD}3)${RESET} ${CYAN}DiffusionGemma-26B-A4B-FP8 (block diffusion)${RESET}"
+    echo -e "   ${GRAY}20k context | ~385 tok/s | denoises a 256-token canvas per step${RESET}"
+    echo -e "   ${GRAY}Gemma 4 MoE dLLM (3.8B active), multimodal, thinking off by default${RESET}"
+    echo -e "   ${GRAY}('3n' = nvidia NVFP4 quant, 131k ctx; no temperature/seed/JSON-mode)${RESET}"
     echo ""
     echo -e "${BOLD}4)${RESET} ${CYAN}Gemma-4-31B-IT-NVFP4 (RedHatAI) + MTP + RAM KV tier${RESET}"
     echo -e "   ${GRAY}90k context (1.12x concurrency) | fp8 KV | 24GB host-RAM prefix cache${RESET}"
@@ -632,15 +634,165 @@ function vllm() {
       GPU_MEM_UTIL=0.983
       EXTRA=(--enable-prefix-caching --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder --max-num-seqs 2 --max-num-batched-tokens 4096 --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
-    3)
-      MODEL_ID="casperhansen/deepseek-r1-distill-qwen-32b-awq"
-      QUANTIZATION="awq_marlin"
-      CONTEXT_SIZE=32768
-      INPUT_MODES="text"
-      DOCKER_NAME="vllm_deepseek_r1_32b_awq"
+    3|3n)
+      # DiffusionGemma 26B-A4B — Google's BLOCK-DIFFUSION Gemma 4 MoE (25.2B total,
+      # 3.8B active, 8 of 128 experts + 1 shared). Replaced the DeepSeek-R1-Distill-32B-AWQ
+      # config on 2026-09-22 (recover it from git history if ever needed).
+      #
+      # NOT autoregressive. An encoder pass caches the prompt causally, then the
+      # decoder denoises a whole 256-token CANVAS with bidirectional attention,
+      # iterating up to max_denoising_steps (48) until the canvas is stable, then
+      # commits it and starts the next one. So "tokens/s" comes from committing
+      # ~15-20 tokens per forward pass, not from one-token-per-step + spec decode.
+      # Both variants share every flag; only the checkpoint/quant/ctx/util differ:
+      #   3   RedHatAI FP8-dynamic (compressed-tensors) — the variant upstream has an
+      #       end-to-end eval recipe for (tests/evals/gsm8k/configs/DiffusionGemma-*.yaml)
+      #   3n  nvidia NVFP4 (modelopt) — ~8 GiB more headroom, see sizing below
+      #
+      # ---- SIZING (weights dominate, but KV and warmup both matter — see STATUS) ----
+      # FP8:   24.48B fp8 + 1.34B bf16 params ~= 25.3 GiB of weights.
+      # NVFP4: modelopt quantizes ONLY the MoE experts — its hf_quant_config.json
+      #        ignores lm_head, *mlp*, *router*, *self_attn*, *self_conditioning*,
+      #        *vision_tower*, *embed_vision* — so 11.4 GB packed fp4 + 1.4 GB scales
+      #        + 3.0B bf16 params ~= 17.5 GiB. Do NOT expect a 4x shrink from "NVFP4".
+      # KV is NOT cheap, despite what the layer_types list suggests. 25 of the 30
+      # layers are sliding (window 1024) and only 5 are full attention with 2 KV
+      # heads x 512, so the arithmetic says "bounded per sequence" — but the
+      # sliding layers draw from the SAME pool, and the measured cost is 68-95
+      # KiB/token (it moves with max_model_len; see the STATUS block). Predicting
+      # it from the config is how this config got sized wrong twice on 2026-09-22.
+      # CONTEXT_SIZE below is a STARTING
+      # POINT — boot cold, read "GPU KV cache size: <N> tokens", and tune from the
+      # measured pool (same discipline as configs 4/4m). Record what you measure here.
+      #
+      # ---- FLAGS, and why ----
+      # --attention-backend TRITON_ATTN: this model passes a per-request causal FLAG
+      #   TENSOR (mixed causal encoder + bidirectional decoder in one batch). Only
+      #   TRITON_ATTN and FA4 handle that; FlashInfer is hard-rejected by vLLM
+      #   (models/config.py), and FA defaults to FA2 on sm_120 (fa_utils.py: FA4 is
+      #   auto-selected only for capability major==10), which raises NotImplementedError
+      #   on the tensor-causal path. vLLM's Gemma4 hook already forces TRITON_ATTN here
+      #   ("FA4 not available"), so this is belt-and-braces — but deliberately explicit:
+      #   if a future image ever ships FA4 for sm_120, we would be silently promoted
+      #   onto a path upstream only validates on SM90 (tests/kernels/attention/
+      #   test_mixed_causal_attn.py), which is exactly how the flashinfer q_cu_seq_lens
+      #   skew bit us at runtime in b19.
+      # --max-num-seqs 1: the diffusion sampler materializes [seqs, canvas, vocab]
+      #   fp32 transients — 1 x 256 x 262144 x 4B = 268 MiB PER SEQUENCE per buffer,
+      #   and there are several. That is the warmup allocation that OOMed this config
+      #   three times on 2026-09-22 (the failing request was for exactly 256 MiB).
+      #   vLLM also CLOBBERS this value to 8 unless it is BELOW its generic default,
+      #   so it must stay small and explicit. 1 is not a throughput compromise worth
+      #   arguing about on a single-user box; `3n` (17.5 GiB of weights) could afford
+      #   2, but shares this line — raise it there only with a cold-boot re-test.
+      #   If more room is ever needed, the next lever is the canvas itself:
+      #   -dc '{"canvas_length":128}' halves every one of those buffers, at the cost
+      #   of committing fewer tokens per step (and deviating from how it was trained).
+      # --enforce-eager: what upstream's only end-to-end recipe uses. FULL-cudagraph
+      #   support is coded (diffusion_gemma.py prepare_attn) but unexercised, and the
+      #   scheduler refuses to pad decode batches for diffusion. TUNING STEP 2: drop it
+      #   and measure; keep it if capture OOMs or regresses.
+      # --max-num-batched-tokens 2048: a decode step budgets 1+canvas_length (=257)
+      #   tokens per running sequence, so this only has to clear 257 — the rest is
+      #   prefill chunk size, and a smaller chunk is less activation memory on a
+      #   config with none to spare.
+      # No --chat-template: the checkpoint's bundled template is used as-is and has
+      #   enable_thinking=false by default (fast path). Callers opt in per request with
+      #   chat_template_kwargs {"enable_thinking": true}. Do NOT point this at
+      #   gemma4-force-think.jinja — that is Gemma 4's template, not this model's (this
+      #   one carries its own tool-loop/turn-closure fixes).
+      # No --kv-cache-dtype: default bf16 for now. fp8 is a later lever (TRITON_ATTN
+      #   supports it, and the NVFP4 checkpoint even ships fp8 KV scales).
+      # No --speculative-config, EVER: canvas_length IS num_speculative_tokens for this
+      #   model (config/vllm.py), and a spec config silently overrides it.
+      # The gemma4 parsers apply because the chat template is Gemma 4-shaped
+      #   (<|channel>thought...<channel|>, <|tool_call>call:...<tool_call|>).
+      #
+      # ---- REQUEST-SHAPE CONSTRAINTS (the real sharp edge of this config) ----
+      # vLLM 400s any request with temperature != 1.0, seed, min_p, min_tokens,
+      # logit_bias, bad_words or allowed_token_ids (sampling_params.py
+      # _validate_diffusion) — the denoiser has its own fixed temperature schedule
+      # (0.8 -> 0.4). Structured outputs / response_format are 400'd too, which also
+      # rules out tool_choice "required" or a named function; --enable-auto-tool-choice
+      # is fine because that parser is pure text. Penalties are accepted but ignored
+      # with a warning. `vllm test` and bench-inference.ts were fixed to stop sending
+      # an explicit temperature; any OTHER client that sends one will fail here.
+      # ---- STATUS: `3` VALIDATED on b22, 2026-09-22 ----
+      # util 0.92 / --max-num-seqs 1 / 20480 ctx: KV 2.37 GiB = 35,477 tokens
+      # (1.73x), idle 31,663 of 32,607 MiB, 0 restarts. Stress: 18,925-token
+      # prompt 1.5s, evicted by a second 18,225-token prompt, then re-prefilled
+      # 0.6s — no OOM. Bench (bench-inference.ts): 385 tok/s mean / 627 peak
+      # end-to-end, 8.0 denoising steps per canvas, 32 tokens committed per step.
+      # The pool is 1.73x the context, so CONTEXT_SIZE could go higher — but the
+      # pool is NOT stable across max_model_len on this hybrid (measured:
+      # 2.85 GiB -> 39,122 tokens at 32k ctx, but 2.36 GiB -> 25,955 at 24k, i.e.
+      # 76 vs 95 KiB/token), so re-measure rather than extrapolating. 20480 is
+      # the value that was actually stress-tested.
+      #
+      # ---- MEASURED, b22, 2026-09-22 (cold boot, FP8 variant) ----
+      # weights 25.86 GiB | profiled activation peak ~1.13 GiB | KV 76.4 KiB/token
+      # (2.85 GiB -> 39,122 tokens). KV is NOT cheap on this model: the 25 sliding
+      # layers draw from the same pool as the 5 full-attention ones, so the window
+      # does not bound it the way the layer_types list suggests.
+      # At util 0.95 + 32768 ctx it BOOTED THE KV POOL AND THEN DIED: the profiler
+      # handed 2.85 GiB to KV, leaving 52 MiB free, and torch inductor's autotune
+      # (benchmark_all_configs, which --enforce-eager does NOT skip) OOMed asking
+      # for 96 MiB. --restart unless-stopped turned that into a crash loop.
+      # Fix was headroom, not a smaller context: util 0.95 -> 0.93 hands ~630 MiB
+      # back, and expandable_segments reclaims the ~210 MiB the OOM report showed
+      # as "reserved but unallocated". Context came down with it because the pool
+      # must stay >= max_model_len or the engine refuses to start.
+      # NOTE the pool is whatever survives weights + peak, so LOWERING CONTEXT
+      # ALONE FREES NOTHING — util (or --num-gpu-blocks-override) is the lever.
+      MODEL_ID="RedHatAI/diffusiongemma-26B-A4B-it-FP8-dynamic"
+      QUANTIZATION="compressed-tensors"
+      CONTEXT_SIZE=20480
+      INPUT_MODES="text,image"
+      DOCKER_NAME="vllm_diffusiongemma_26b_fp8"
+      DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.95
-      EXTRA=(--enable-prefix-caching)
+      # No KV connector here (unlike config 4), so expandable_segments is allowed
+      # — and this config needs it: see the fragmentation note above.
+      ENV_ARGS=(--env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+      # 0.92, NOT the 0.982 the Gemma 4 configs use. Two separate reasons, and
+      # both are real — do not raise this without re-running a cold boot.
+      # (1) STARTUP CHECK. vLLM refuses to start when
+      # FREE memory < util x TOTAL, and this box has a PERMANENT ~500 MiB GPU
+      # resident: the `laya` container (uvicorn on :8100). Measured 2026-09-22:
+      # free 30.39 of 31.41 GiB with every vLLM container stopped, so anything
+      # above ~0.967 dies instantly with "Free memory on device cuda:0 ... is
+      # less than desired GPU memory utilization" — and --restart unless-stopped
+      # turns that into a crash loop, not a visible failure. (The 4/4m configs
+      # boot at 0.982 only because laya's allocation is lazy — it was not
+      # resident when they last started.)
+      # (2) HEADROOM FOR A TRANSIENT THE BUDGET DOES NOT COVER. The KV pool always
+      # expands to fill util x TOTAL, so what protects warmup is the gap between
+      # that budget and the memory actually free: 30.39 - util x 31.41. Warmup then
+      # has to fit in that gap. Measured with --max-num-seqs 2: the process peaked
+      # at 30.64 GiB, i.e. ~1.4 GiB ABOVE a 29.21 GiB budget, so 0.93 (gap 1.18 GiB)
+      # still OOMed. 0.92 leaves a ~1.49 GiB gap, and --max-num-seqs 1 roughly
+      # halves what has to fit in it. Both were needed; neither alone sufficed.
+      GPU_MEM_UTIL=0.92
+      # ---- STATUS: `3n` VALIDATED on b22, 2026-09-22 ----
+      # Same util/flags, 131072 ctx: weights 17.96 GiB (vs 25.86 FP8), KV 10.14 GiB
+      # = 763,555 tokens (5.83x), idle 31,583 MiB, 0 restarts. 45,925-token prompt
+      # answered in 3.9s. Bench: 444 tok/s mean / 726 peak, 9.8 denoising steps per
+      # canvas, 26.3 tokens per step — faster than `3` AND 6x the context, which is
+      # what the extra ~8 GiB buys. Prefer this variant unless you specifically
+      # want the FP8 checkpoint upstream evaluates.
+      # NOTE the per-token KV cost is ~14 KiB here vs 68-95 KiB on `3`: the sliding
+      # layers' per-sequence cost amortizes over a much longer context. It is the
+      # same model — so never carry a token/GiB figure between these two configs.
+      # The pool is 5.83x the context, so 262144 (the checkpoint's
+      # max_position_embeddings) is probably reachable; UNTESTED, and the pool does
+      # not scale linearly with max_model_len, so measure before trusting it.
+      if [ "$model_choice" = "3n" ]; then
+        MODEL_ID="nvidia/diffusiongemma-26B-A4B-it-NVFP4"
+        QUANTIZATION="modelopt_fp4"
+        CONTEXT_SIZE=131072
+        DOCKER_NAME="vllm_diffusiongemma_26b_nvfp4"
+      fi
+      EXTRA=(--enable-prefix-caching --attention-backend TRITON_ATTN --max-num-seqs 1 --max-num-batched-tokens 2048 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --enforce-eager)
       ;;
     4)
       # 4m's stack (RedHatAI NVFP4 + Google MTP drafter + fp8 KV + a pinned block
@@ -1030,7 +1182,11 @@ function vllm() {
       echo "Sending request to model..."
       echo ""
 
-      # Build JSON request using Python to properly escape everything
+      # Build JSON request using Python to properly escape everything.
+      # NO explicit temperature: vLLM then applies each model's own
+      # generation_config.json defaults (what every checkpoint here recommends
+      # anyway), and diffusion configs (3/3n) stay usable — they 400 on any
+      # temperature != 1.0, since the denoiser owns its own schedule.
       RESPONSE=$(python3 -c "
 import json
 import sys
@@ -1042,7 +1198,6 @@ prompt = '''$USER_PROMPT'''
 data = {
     'model': model_id,
     'messages': [{'role': 'user', 'content': prompt}],
-    'temperature': 0.7,
     'max_tokens': 500
 }
 
